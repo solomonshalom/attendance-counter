@@ -1,6 +1,0 @@
-name = "justatemp-mailbox"
-main = "src/index.ts"
-compatibility_date = "2023-02-17"
-kv_namespaces = [
-  { binding = "POST_DB", id = "847cc232b0c3442ab06e123cd0496cdb", preview_id = "238c3081e8ae49f091c08df88cf6c079" }
-]

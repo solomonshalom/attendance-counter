@@ -109,3 +109,20 @@ dev.md
 # Key files
 *.pem
 record.txt
+
+# Counter service (Python)
+counter/.venv/
+counter/data/
+counter/models/
+counter/.env
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Frontend
+frontend/.svelte-kit/
+frontend/build/
+frontend/.wrangler/
+
+# OS
+.DS_Store

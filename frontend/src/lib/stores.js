@@ -1,15 +1,54 @@
-import { writable } from "svelte/store"
-import { browser } from "$app/environment"
+import { writable, derived } from 'svelte/store';
 
-// Generate a random email address incase it's not set in local storage
-import { generate } from "random-words";
+/** @typedef {{
+ *   session_id: string|null,
+ *   session_label: string,
+ *   session_started_at: number|null,
+ *   in_count: number,
+ *   out_count: number,
+ *   inside: number,
+ *   peak_inside: number,
+ *   line: { x1: number, y1: number, x2: number, y2: number },
+ *   status: {
+ *     running: boolean,
+ *     model_loaded: boolean,
+ *     camera_open: boolean,
+ *     fps: number,
+ *     last_error: string|null,
+ *     frame_width: number,
+ *     frame_height: number,
+ *     device: string,
+ *     model_name: string,
+ *     last_frame_at: number
+ *   }
+ * }} CounterState */
 
-let words = generate({ exactly: 2, maxLength: 5 });
-let alt = words[0] + "." + words[1] + Math.floor(Math.random() * 1000) + "@justatemp.com"; // format: word1.word2<random_number>@justatemp.com
+/** @type {import('svelte/store').Writable<CounterState|null>} */
+export const counterState = writable(null);
 
-// Make the email address a store
-// Thanks to u/sharath725 (https://www.reddit.com/r/sveltejs/comments/p438og/comment/h90fdjc)
-export const receivingEmail = writable(browser && localStorage.getItem("receivingEmail") || alt) // hihi
-receivingEmail.subscribe((val) => {                                                              // 2690 is the count of received emails by junk.boats
-  if (browser) return (localStorage.receivingEmail = val)
-})
+/** @type {import('svelte/store').Writable<'connecting'|'connected'|'disconnected'>} */
+export const connectionStatus = writable('connecting');
+
+/**
+ * @typedef {{ id: number, session_id: string, ts: number, kind: 'in'|'out', tracker_id: number|null }} CrossingEvent
+ * @type {import('svelte/store').Writable<CrossingEvent[]>}
+ */
+export const recentEvents = writable([]);
+
+const MAX_RECENT_EVENTS = 50;
+
+/** @param {CrossingEvent} event */
+export function pushEvent(event) {
+	recentEvents.update((events) => {
+		const next = [event, ...events];
+		return next.slice(0, MAX_RECENT_EVENTS);
+	});
+}
+
+export function clearEvents() {
+	recentEvents.set([]);
+}
+
+export const isSessionActive = derived(counterState, ($state) =>
+	Boolean($state?.session_id)
+);
