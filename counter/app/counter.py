@@ -378,6 +378,37 @@ class Counter:
             self._dedupe_check = is_duplicate
             self._dedupe_record = record
 
+    def update_homography(self, H: np.ndarray | None) -> None:
+        """Replace the homography matrix used for image→world projection.
+
+        Hot-swap-safe: existing tracker state, line counters, peak_inside, and
+        the active session's running totals are preserved. Only the world-coord
+        projection result changes from this frame onward. Use this from the
+        manager when calibration is updated mid-session instead of stop+restart,
+        which would reset all tracker IDs.
+        """
+        with self._lock:
+            self._homography = H
+            self.state.calibrated = H is not None
+        self._broadcast_state()
+
+    def has_homography(self) -> bool:
+        """Cheap, lock-free check for whether a homography is currently
+        attached. Used by the manager when deciding whether to wire dedupe
+        hooks. CPython attribute reads are atomic so no lock is required."""
+        return self._homography is not None
+
+    def update_venue_id(self, venue_id: str | None) -> None:
+        """Reassign this counter to a venue (or detach with None).
+
+        Only updates the displayed state; the manager is responsible for
+        rewiring the dedupe hooks separately because those hooks need to know
+        the deduper instance, not just the venue id.
+        """
+        with self._lock:
+            self.state.venue_id = venue_id
+        self._broadcast_state()
+
     # ------------------------------------------------------------------ public
 
     def start(self) -> None:

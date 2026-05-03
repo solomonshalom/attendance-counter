@@ -483,52 +483,41 @@ class CameraManager:
         with self._lock:
             removed = self.storage.delete_venue(venue_id)
             if removed:
-                # Re-instantiate any counters that were assigned to this venue
-                # so their dedupe hooks (which captured the now-deleted venue_id)
-                # are detached.
+                # Detach dedupe hooks from any counter that referenced the
+                # now-deleted venue. The counter's homography is left intact —
+                # a camera can be re-assigned to another venue later without
+                # recalibration.
                 for cam_id, counter in list(self._counters.items()):
                     if counter.state.venue_id == venue_id:
-                        was_running = counter.is_running()
-                        if was_running:
-                            counter.stop()
-                        self._counters.pop(cam_id, None)
-                        row = self.storage.get_camera(cam_id)
-                        if row is not None:
-                            new_counter = self._instantiate(row)
-                            self._counters[cam_id] = new_counter
-                            for cb in self._event_listeners:
-                                new_counter.add_event_listener(cb)
-                            for cb in self._state_listeners:
-                                new_counter.add_state_listener(cb)
-                            if was_running and row["enabled"]:
-                                new_counter.start()
+                        counter.update_venue_id(None)
+                        self._wire_dedupe_hooks(counter, cam_id, venue_id=None)
         if removed:
             self._deduper.remove_venue(venue_id)
             self._broadcast_camera_list()
         return removed
 
     def assign_camera_to_venue(self, camera_id: str, venue_id: str | None) -> dict[str, Any]:
-        """Move a camera into / out of a venue. Triggers a counter rebuild so
-        the new dedupe wiring takes effect."""
+        """Move a camera into / out of a venue.
+
+        Hot-swaps the dedupe hooks instead of restarting the counter, so the
+        active session's tracker IDs, line counts, and peak_inside survive the
+        venue change.
+        """
         with self._lock:
             row = self.storage.get_camera(camera_id)
             if row is None:
                 raise KeyError(camera_id)
             self.storage.assign_camera_to_venue(camera_id, venue_id)
-            counter = self._counters.pop(camera_id, None)
-            was_running = counter.is_running() if counter else False
-            if counter is not None:
-                counter.stop()
             updated = self.storage.get_camera(camera_id)
             assert updated is not None
-            new_counter = self._instantiate(updated)
-            self._counters[camera_id] = new_counter
-            for cb in self._event_listeners:
-                new_counter.add_event_listener(cb)
-            for cb in self._state_listeners:
-                new_counter.add_state_listener(cb)
-            if was_running and updated["enabled"]:
-                new_counter.start()
+
+            counter = self._counters.get(camera_id)
+            if counter is not None:
+                # Update the in-memory state so any future broadcasts reflect
+                # the new venue_id, then rewire dedupe hooks for the new
+                # (venue, camera) pair. No thread restart needed.
+                counter.update_venue_id(venue_id)
+                self._wire_dedupe_hooks(counter, camera_id, venue_id)
         self._broadcast_camera_list()
         return self.get_state(camera_id) or {}
 
@@ -643,40 +632,29 @@ class CameraManager:
                 homography=[float(x) for x in H.flatten().tolist()],
                 reprojection_error_m=mean_error_m,
             )
-            # Rebuild counter with the new homography in place.
-            counter = self._counters.pop(camera_id, None)
-            was_running = counter.is_running() if counter else False
+            # Hot-swap H + rewire dedupe hooks. Existing tracker state, line
+            # counters, peak_inside, and the active session all survive — only
+            # the world-position projection result changes from this frame on.
+            counter = self._counters.get(camera_id)
             if counter is not None:
-                counter.stop()
-            row = self.storage.get_camera(camera_id)
-            if row is not None:
-                new_counter = self._instantiate(row)
-                self._counters[camera_id] = new_counter
-                for cb in self._event_listeners:
-                    new_counter.add_event_listener(cb)
-                for cb in self._state_listeners:
-                    new_counter.add_state_listener(cb)
-                if was_running and row["enabled"]:
-                    new_counter.start()
+                counter.update_homography(H)
+                row = self.storage.get_camera(camera_id)
+                self._wire_dedupe_hooks(
+                    counter,
+                    camera_id,
+                    venue_id=row.get("venue_id") if row else None,
+                )
         return calib
 
     def clear_calibration(self, camera_id: str) -> bool:
         with self._lock:
             removed = self.storage.delete_calibration(camera_id)
-            counter = self._counters.pop(camera_id, None)
-            was_running = counter.is_running() if counter else False
+            counter = self._counters.get(camera_id)
             if counter is not None:
-                counter.stop()
-            row = self.storage.get_camera(camera_id)
-            if row is not None:
-                new_counter = self._instantiate(row)
-                self._counters[camera_id] = new_counter
-                for cb in self._event_listeners:
-                    new_counter.add_event_listener(cb)
-                for cb in self._state_listeners:
-                    new_counter.add_state_listener(cb)
-                if was_running and row["enabled"]:
-                    new_counter.start()
+                # Drop H and unhook dedupe — without H we have no world coords,
+                # so cross-camera dedupe cannot match this camera's events.
+                counter.update_homography(None)
+                self._wire_dedupe_hooks(counter, camera_id, venue_id=None)
         return removed
 
     # ----------------------------------------------------------------- helpers
@@ -727,16 +705,35 @@ class CameraManager:
 
         # Wire dedupe callbacks: counter consults the deduper before persisting
         # an event from a calibrated camera in a venue.
-        if venue_id and homography is not None:
+        self._wire_dedupe_hooks(counter, row["id"], venue_id)
+        return counter
+
+    def _wire_dedupe_hooks(
+        self,
+        counter: Counter,
+        camera_id: str,
+        venue_id: str | None,
+    ) -> None:
+        """Attach or detach the venue-level dedupe hooks on a counter.
+
+        Hooks are only meaningful when both:
+          - the camera is assigned to a venue, and
+          - it has a homography (so world coords are available).
+        Otherwise we clear the hooks; events still flow but never get matched
+        against another camera's events.
+        """
+        has_h = counter.has_homography()
+        if venue_id and has_h:
             counter.set_dedupe_hooks(
                 is_duplicate=lambda kind, wx, wy, ts: self._deduper.is_duplicate(
-                    venue_id, row["id"], kind, wx, wy, ts
+                    venue_id, camera_id, kind, wx, wy, ts
                 ),
                 record=lambda kind, wx, wy, ts: self._deduper.record(
-                    venue_id, row["id"], kind, wx, wy, ts
+                    venue_id, camera_id, kind, wx, wy, ts
                 ),
             )
-        return counter
+        else:
+            counter.set_dedupe_hooks(None, None)
 
     def _row_state_snapshot(self, row: dict[str, Any]) -> dict[str, Any]:
         return {
