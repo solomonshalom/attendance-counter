@@ -1,9 +1,26 @@
 <!DOCTYPE html>
-<html data-bs-theme="light" lang="en">
+<html lang="en">
 
 	<head>
 		<meta charset="utf-8">
 		<meta name="viewport" content="width=device-width, initial-scale=1.0, shrink-to-fit=no">
+		<script>
+			// Apply the saved theme synchronously so there's no flash of light theme
+			// for dark-mode users. Mirrors the logic in stores.js's `theme` store.
+			(function () {
+				try {
+					var s = localStorage.getItem('counter.theme');
+					var t = (s === 'dark' || s === 'light')
+						? s
+						: (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+					document.documentElement.setAttribute('data-theme', t);
+					document.documentElement.setAttribute('data-bs-theme', t);
+				} catch (e) {
+					document.documentElement.setAttribute('data-theme', 'light');
+					document.documentElement.setAttribute('data-bs-theme', 'light');
+				}
+			})();
+		</script>
 		%sveltekit.head%
 		<title>Attendance Counter</title>
 		<meta name="description" content="Real-time church attendance counter using YOLO and computer vision.">
@@ -16,8 +33,6 @@
 		<link rel="icon" type="image/png" sizes="192x192" href="/assets/img/android-chrome-192x192.png?h=70b5822a650fbd65b442efd5fc202d9e">
 		<link rel="icon" type="image/png" sizes="512x512" href="/assets/img/android-chrome-512x512.png?h=70b5822a650fbd65b442efd5fc202d9e">
 		<link rel="stylesheet" href="/assets/bootstrap/css/bootstrap.min.css?h=cd822b7fd22c8a95a68470c795adea69">
-		<link rel="preconnect" href="https://fonts.bunny.net">
-		<link href="https://fonts.bunny.net/css?family=inter:100,200,300,400,500,600,700,800,900|inter-tight:100,100i,200,200i,300,300i,400,400i,500,500i,600,600i,700,700i,800,800i,900i" rel="stylesheet" />
 	</head>
 
 	<body data-sveltekit-preload-data="hover" style="font-family: Inter, sans-serif;">

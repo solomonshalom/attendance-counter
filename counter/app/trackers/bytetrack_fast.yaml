@@ -1,0 +1,10 @@
+# ByteTrack baseline — faster than BoT-SORT (no ReID, no GMC), keep as fallback
+# for low-end hardware or when ReID isn't loadable.
+
+tracker_type: bytetrack
+track_high_thresh: 0.30
+track_low_thresh: 0.10
+new_track_thresh: 0.40
+track_buffer: 45
+match_thresh: 0.85
+fuse_score: True

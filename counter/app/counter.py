@@ -1,12 +1,13 @@
-"""Inference loop: read frames, detect+track people, count line crossings."""
+"""Per-camera inference loop: detect+track people, count line crossings & zones."""
 
 from __future__ import annotations
 
-import json
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Iterable
 
 import cv2
@@ -20,8 +21,10 @@ from .storage import Storage
 
 log = logging.getLogger("counter")
 
-EventCallback = Callable[[dict[str, Any]], None]
-StateCallback = Callable[[dict[str, Any]], None]
+EventCallback = Callable[[str, dict[str, Any]], None]
+StateCallback = Callable[[str, dict[str, Any]], None]
+
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm", ".mpg", ".mpeg"}
 
 
 def _resolve_device(requested: str) -> str:
@@ -34,19 +37,64 @@ def _resolve_device(requested: str) -> str:
     return requested
 
 
-def _open_capture(source: str, width: int, height: int, fps: int) -> cv2.VideoCapture:
-    """Open camera or RTSP/HTTP stream. Index source like '0' becomes int(0)."""
+def _looks_like_video_file(path: str) -> bool:
+    if not path:
+        return False
+    if path.startswith(("rtsp://", "rtmp://", "http://", "https://")):
+        return False
+    try:
+        int(path)
+        return False
+    except ValueError:
+        pass
+    p = Path(path).expanduser()
+    return p.suffix.lower() in VIDEO_EXTENSIONS or p.is_file()
+
+
+def _resolve_tracker_path(name: str, settings: Settings) -> str:
+    """Return an absolute path/identifier ultralytics can use for tracker config.
+
+    Accepts:
+      - shipped names: 'botsort_reid', 'bytetrack_fast' (our YAMLs in trackers_dir)
+      - upstream names: 'bytetrack.yaml', 'botsort.yaml' (ultralytics built-ins)
+      - absolute paths to a yaml file.
+    """
+    name = (name or "").strip() or "botsort_reid"
+    if name.endswith(".yaml") and Path(name).is_file():
+        return str(Path(name).resolve())
+    if name in ("bytetrack.yaml", "botsort.yaml"):
+        return name
+    candidate = settings.trackers_dir / f"{name}.yaml"
+    if candidate.is_file():
+        return str(candidate.resolve())
+    log.warning("Tracker %r not found; falling back to bytetrack.yaml", name)
+    return "bytetrack.yaml"
+
+
+def _open_capture(
+    source: str,
+    width: int,
+    height: int,
+    fps: int,
+    is_video_file: bool,
+) -> cv2.VideoCapture:
+    """Open camera, RTSP/HTTP stream, or local video file."""
+    if is_video_file:
+        path = str(Path(source).expanduser())
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            raise RuntimeError(f"Could not open video file: {source}")
+        return cap
+
     src: int | str
     try:
         src = int(source)
     except ValueError:
         src = source
 
-    # On macOS, AVFoundation is the right backend for built-in / USB cams.
     backend = cv2.CAP_AVFOUNDATION if isinstance(src, int) else cv2.CAP_ANY
     cap = cv2.VideoCapture(src, backend)
     if not cap.isOpened():
-        # Fall back to default backend.
         cap = cv2.VideoCapture(src)
     if not cap.isOpened():
         if isinstance(src, int):
@@ -54,24 +102,24 @@ def _open_capture(source: str, width: int, height: int, fps: int) -> cv2.VideoCa
                 f"Could not open camera index {src}. On macOS, ensure your "
                 "terminal has Camera permission (System Settings → Privacy & "
                 "Security → Camera). Also verify no other app is using the "
-                "camera, or try a different COUNTER_SOURCE value."
+                "camera, or try a different source value."
             )
         raise RuntimeError(f"Could not open video source: {source}")
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
     cap.set(cv2.CAP_PROP_FPS, fps)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # minimize latency
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     return cap
 
 
 @dataclass
 class LineConfig:
-    """Line position in normalized [0..1] coordinates."""
     x1: float
     y1: float
     x2: float
     y2: float
+    name: str = "doorway"
 
     def to_pixels(self, width: int, height: int) -> tuple[sv.Point, sv.Point]:
         return (
@@ -79,13 +127,60 @@ class LineConfig:
             sv.Point(x=int(self.x2 * width), y=int(self.y2 * height)),
         )
 
-    def as_dict(self) -> dict[str, float]:
-        return {"x1": self.x1, "y1": self.y1, "x2": self.x2, "y2": self.y2}
+    def as_dict(self) -> dict[str, Any]:
+        return {"x1": self.x1, "y1": self.y1, "x2": self.x2, "y2": self.y2, "name": self.name}
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "LineConfig":
+        return cls(
+            x1=float(d.get("x1", 0.5)),
+            y1=float(d.get("y1", 0.0)),
+            x2=float(d.get("x2", 0.5)),
+            y2=float(d.get("y2", 1.0)),
+            name=str(d.get("name", "doorway")),
+        )
+
+
+@dataclass
+class ZoneConfig:
+    name: str
+    role: str  # observer | interior | entry | exit
+    polygon: list[tuple[float, float]]  # normalized [0..1]
+
+    def to_pixels(self, width: int, height: int) -> np.ndarray:
+        pts = np.array(
+            [(int(x * width), int(y * height)) for x, y in self.polygon],
+            dtype=np.int64,
+        )
+        return pts
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "role": self.role,
+            "polygon": [{"x": x, "y": y} for x, y in self.polygon],
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "ZoneConfig":
+        polygon_raw = d.get("polygon", [])
+        polygon: list[tuple[float, float]] = []
+        for p in polygon_raw:
+            if isinstance(p, dict):
+                polygon.append((float(p.get("x", 0.0)), float(p.get("y", 0.0))))
+            elif isinstance(p, (list, tuple)) and len(p) >= 2:
+                polygon.append((float(p[0]), float(p[1])))
+        return cls(
+            name=str(d.get("name", "zone")),
+            role=str(d.get("role", "observer")),
+            polygon=polygon,
+        )
 
 
 @dataclass
 class CounterStatus:
     running: bool = False
+    paused: bool = False
     model_loaded: bool = False
     camera_open: bool = False
     fps: float = 0.0
@@ -94,12 +189,23 @@ class CounterStatus:
     frame_height: int = 0
     device: str = "cpu"
     model_name: str = ""
+    tracker: str = ""
     last_frame_at: float = 0.0
+    # Video file state.
+    is_video_file: bool = False
+    video_total_frames: int = 0
+    video_position: int = 0
+    video_fps: float = 0.0
 
 
 @dataclass
 class CounterState:
-    """Live counter state shared between inference loop and HTTP/WS clients."""
+    camera_id: str = ""
+    camera_name: str = ""
+    source: str = ""
+    kind: str = "camera"
+    mirror: bool = False
+    enabled: bool = True
     session_id: str | None = None
     session_label: str = ""
     session_started_at: float | None = None
@@ -107,8 +213,17 @@ class CounterState:
     out_count: int = 0
     peak_inside: int = 0
     line: LineConfig = field(
-        default_factory=lambda: LineConfig(0.5, 0.0, 0.5, 1.0)
+        default_factory=lambda: LineConfig(0.5, 0.0, 0.5, 1.0, "doorway")
     )
+    lines: list[LineConfig] = field(default_factory=list)
+    zones: list[ZoneConfig] = field(default_factory=list)
+    zone_counts: dict[str, int] = field(default_factory=dict)
+    confidence: float | None = None
+    iou: float | None = None
+    imgsz: int | None = None
+    tracker: str | None = None
+    loop_video: bool = True
+    paused: bool = False
     status: CounterStatus = field(default_factory=CounterStatus)
 
     @property
@@ -117,6 +232,12 @@ class CounterState:
 
     def as_dict(self) -> dict[str, Any]:
         return {
+            "camera_id": self.camera_id,
+            "camera_name": self.camera_name,
+            "source": self.source,
+            "kind": self.kind,
+            "mirror": self.mirror,
+            "enabled": self.enabled,
             "session_id": self.session_id,
             "session_label": self.session_label,
             "session_started_at": self.session_started_at,
@@ -125,8 +246,18 @@ class CounterState:
             "inside": self.inside,
             "peak_inside": self.peak_inside,
             "line": self.line.as_dict(),
+            "lines": [ln.as_dict() for ln in self.lines],
+            "zones": [z.as_dict() for z in self.zones],
+            "zone_counts": dict(self.zone_counts),
+            "confidence": self.confidence,
+            "iou": self.iou,
+            "imgsz": self.imgsz,
+            "tracker": self.tracker,
+            "loop_video": self.loop_video,
+            "paused": self.paused,
             "status": {
                 "running": self.status.running,
+                "paused": self.status.paused,
                 "model_loaded": self.status.model_loaded,
                 "camera_open": self.status.camera_open,
                 "fps": round(self.status.fps, 2),
@@ -135,38 +266,86 @@ class CounterState:
                 "frame_height": self.status.frame_height,
                 "device": self.status.device,
                 "model_name": self.status.model_name,
+                "tracker": self.status.tracker,
                 "last_frame_at": self.status.last_frame_at,
+                "is_video_file": self.status.is_video_file,
+                "video_total_frames": self.status.video_total_frames,
+                "video_position": self.status.video_position,
+                "video_fps": self.status.video_fps,
             },
         }
 
 
 class Counter:
-    """Background thread that runs YOLO + supervision LineZone counting."""
+    """Background thread: reads frames, runs detection+tracking, counts line crossings & zones."""
 
-    LINE_SETTING_KEY = "line_config"
+    _model_load_lock = threading.Lock()
 
-    def __init__(self, settings: Settings, storage: Storage) -> None:
+    def __init__(
+        self,
+        camera_id: str,
+        name: str,
+        source: str,
+        mirror: bool,
+        line: LineConfig,
+        settings: Settings,
+        storage: Storage,
+        enabled: bool = True,
+        kind: str = "camera",
+        confidence: float | None = None,
+        iou: float | None = None,
+        imgsz: int | None = None,
+        tracker: str | None = None,
+        loop_video: bool = True,
+        lines: list[LineConfig] | None = None,
+        zones: list[ZoneConfig] | None = None,
+    ) -> None:
+        self.camera_id = camera_id
         self.settings = settings
         self.storage = storage
 
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
-        self._counting_event = threading.Event()  # set => actively counting
+        self._counting_event = threading.Event()
+        self._restart_event = threading.Event()
         self._thread: threading.Thread | None = None
 
-        # Latest annotated frame (JPEG-encoded bytes) for MJPEG preview.
         self._latest_jpeg: bytes | None = None
         self._frame_cv = threading.Condition()
 
         self._event_listeners: list[EventCallback] = []
         self._state_listeners: list[StateCallback] = []
 
-        self.state = CounterState()
-        self._restore_line()
+        all_lines = lines if lines is not None else [line]
+        self.state = CounterState(
+            camera_id=camera_id,
+            camera_name=name,
+            source=source,
+            kind=kind,
+            mirror=mirror,
+            enabled=enabled,
+            line=line,
+            lines=all_lines,
+            zones=zones or [],
+            confidence=confidence,
+            iou=iou,
+            imgsz=imgsz,
+            tracker=tracker,
+            loop_video=loop_video,
+        )
 
-        # Track inside-count for each tracker_id we've seen crossing.
-        self._tracked_ids_in: set[int] = set()
-        self._tracked_ids_out: set[int] = set()
+        # Per-line dedup (set of tracker_ids that have already been counted in/out
+        # on a specific named line during the current session).
+        self._tracked_in_per_line: dict[str, set[int]] = {}
+        self._tracked_out_per_line: dict[str, set[int]] = {}
+        self._line_zones: dict[str, sv.LineZone] = {}
+        self._dirty_geometry = True
+
+        # Track-state machine for polygon zones (interior occupancy etc.)
+        self._zone_states: dict[str, sv.PolygonZone] = {}
+
+        # Smoother for stable bboxes/anchor positions across frames.
+        self._smoother: sv.DetectionsSmoother | None = None
 
     # ------------------------------------------------------------------ public
 
@@ -175,16 +354,41 @@ class Counter:
             if self._thread and self._thread.is_alive():
                 return
             self._stop_event.clear()
+            self._restart_event.clear()
             self._thread = threading.Thread(
-                target=self._run, name="counter", daemon=True
+                target=self._run,
+                name=f"counter[{self.camera_id[:8]}]",
+                daemon=True,
             )
             self._thread.start()
 
-    def stop(self) -> None:
+    def stop(self, timeout: float = 10.0) -> None:
+        if self.state.session_id:
+            try:
+                self.stop_session()
+            except Exception:
+                log.exception("Error stopping session for camera %s", self.camera_id)
         self._stop_event.set()
+        with self._frame_cv:
+            self._frame_cv.notify_all()
         thread = self._thread
         if thread and thread.is_alive():
-            thread.join(timeout=10.0)
+            thread.join(timeout=timeout)
+        with self._lock:
+            self._thread = None
+            self.state.status.running = False
+            self.state.status.camera_open = False
+            self.state.status.model_loaded = False
+            self.state.status.fps = 0.0
+        self._broadcast_state()
+
+    def request_restart(self) -> None:
+        """Ask the inference loop to reopen its capture (e.g. after seek/restart)."""
+        self._restart_event.set()
+
+    def is_running(self) -> bool:
+        t = self._thread
+        return bool(t and t.is_alive())
 
     def add_event_listener(self, cb: EventCallback) -> None:
         with self._lock:
@@ -204,23 +408,60 @@ class Counter:
             if cb in self._state_listeners:
                 self._state_listeners.remove(cb)
 
+    def update_meta(
+        self,
+        *,
+        name: str | None = None,
+        mirror: bool | None = None,
+        enabled: bool | None = None,
+        kind: str | None = None,
+        confidence: float | None = None,
+        iou: float | None = None,
+        imgsz: int | None = None,
+        tracker: str | None = None,
+        loop_video: bool | None = None,
+        paused: bool | None = None,
+    ) -> None:
+        with self._lock:
+            if name is not None:
+                self.state.camera_name = name
+            if mirror is not None:
+                self.state.mirror = mirror
+            if enabled is not None:
+                self.state.enabled = enabled
+            if kind is not None:
+                self.state.kind = kind
+            if confidence is not None:
+                self.state.confidence = confidence
+            if iou is not None:
+                self.state.iou = iou
+            if imgsz is not None:
+                self.state.imgsz = imgsz
+            if tracker is not None:
+                self.state.tracker = tracker
+            if loop_video is not None:
+                self.state.loop_video = loop_video
+            if paused is not None:
+                self.state.paused = paused
+                self.state.status.paused = paused
+        self._broadcast_state()
+
     def start_session(self, label: str = "") -> dict[str, Any]:
         with self._lock:
-            # Auto-close any prior open session.
-            existing = self.storage.latest_open_session()
+            existing = self.storage.latest_open_session_for_camera(self.camera_id)
             if existing:
                 self.storage.end_session(existing["id"])
 
-            session = self.storage.start_session(label=label)
+            session = self.storage.start_session(label=label, camera_id=self.camera_id)
             self.state.session_id = session["id"]
             self.state.session_label = session["label"]
             self.state.session_started_at = session["started_at"]
             self.state.in_count = 0
             self.state.out_count = 0
             self.state.peak_inside = 0
-            self._tracked_ids_in.clear()
-            self._tracked_ids_out.clear()
-            self._reset_line_zone()
+            self._tracked_in_per_line.clear()
+            self._tracked_out_per_line.clear()
+            self._dirty_geometry = True
             self._counting_event.set()
         self._broadcast_state()
         return session
@@ -230,7 +471,6 @@ class Counter:
             if not self.state.session_id:
                 return None
             session_id = self.state.session_id
-            # Flush final counts before closing.
             self.storage.update_session_counts(
                 session_id,
                 self.state.in_count,
@@ -250,9 +490,9 @@ class Counter:
             self.state.in_count = 0
             self.state.out_count = 0
             self.state.peak_inside = 0
-            self._tracked_ids_in.clear()
-            self._tracked_ids_out.clear()
-            self._reset_line_zone()
+            self._tracked_in_per_line.clear()
+            self._tracked_out_per_line.clear()
+            self._dirty_geometry = True
             if self.state.session_id:
                 self.storage.update_session_counts(
                     self.state.session_id, 0, 0, 0
@@ -260,15 +500,40 @@ class Counter:
         self._broadcast_state()
 
     def set_line(self, line: LineConfig) -> None:
+        """Legacy single-line setter; mirrors into the lines list at index 0."""
         with self._lock:
             self.state.line = line
-            self.storage.set_setting(
-                self.LINE_SETTING_KEY,
-                json.dumps(line.as_dict()),
+            if self.state.lines:
+                self.state.lines[0] = line
+            else:
+                self.state.lines = [line]
+            self.storage.set_camera_line(self.camera_id, line.as_dict())
+            self._dirty_geometry = True
+            self._tracked_in_per_line.clear()
+            self._tracked_out_per_line.clear()
+        self._broadcast_state()
+
+    def set_lines(self, lines: list[LineConfig]) -> None:
+        if not lines:
+            raise ValueError("at least one line required")
+        with self._lock:
+            self.state.lines = lines
+            self.state.line = lines[0]
+            self.storage.replace_lines(
+                self.camera_id, [ln.as_dict() for ln in lines]
             )
-            self._reset_line_zone()
-            self._tracked_ids_in.clear()
-            self._tracked_ids_out.clear()
+            self._dirty_geometry = True
+            self._tracked_in_per_line.clear()
+            self._tracked_out_per_line.clear()
+        self._broadcast_state()
+
+    def set_zones(self, zones: list[ZoneConfig]) -> None:
+        with self._lock:
+            self.state.zones = zones
+            self.storage.replace_zones(
+                self.camera_id, [z.as_dict() for z in zones]
+            )
+            self._dirty_geometry = True
         self._broadcast_state()
 
     def get_state_dict(self) -> dict[str, Any]:
@@ -285,37 +550,65 @@ class Counter:
 
     # ---------------------------------------------------------------- internal
 
-    def _restore_line(self) -> None:
-        raw = self.storage.get_setting(self.LINE_SETTING_KEY)
-        if raw:
+    def _build_line_zones(self, width: int, height: int) -> dict[str, sv.LineZone]:
+        out: dict[str, sv.LineZone] = {}
+        names_seen: set[str] = set()
+        min_thresh = max(1, self.settings.min_crossing_threshold)
+        for ln in self.state.lines:
+            base = ln.name or "doorway"
+            name = base
+            n = 1
+            while name in names_seen:
+                n += 1
+                name = f"{base} #{n}"
+            names_seen.add(name)
+            start, end = ln.to_pixels(width, height)
+            # BOTTOM_CENTER ≈ feet; the standard single-anchor for people counting.
+            # Default 4-corner trigger silently skips while the bbox straddles
+            # the line, which dropped real crossings on long-bodied detections.
+            out[name] = sv.LineZone(
+                start=start,
+                end=end,
+                triggering_anchors=(sv.Position.BOTTOM_CENTER,),
+                minimum_crossing_threshold=min_thresh,
+            )
+        return out
+
+    def _build_polygon_zones(self, width: int, height: int) -> dict[str, sv.PolygonZone]:
+        out: dict[str, sv.PolygonZone] = {}
+        names_seen: set[str] = set()
+        for z in self.state.zones:
+            if len(z.polygon) < 3:
+                continue
+            base = z.name or "zone"
+            name = base
+            n = 1
+            while name in names_seen:
+                n += 1
+                name = f"{base} #{n}"
+            names_seen.add(name)
             try:
-                data = json.loads(raw)
-                self.state.line = LineConfig(**data)
-                return
+                pts = z.to_pixels(width, height)
+                out[name] = sv.PolygonZone(
+                    polygon=pts,
+                    triggering_anchors=(sv.Position.BOTTOM_CENTER,),
+                )
             except Exception:
-                log.warning("Could not parse stored line config; using defaults.")
-        self.state.line = LineConfig(
-            self.settings.default_line_x1,
-            self.settings.default_line_y1,
-            self.settings.default_line_x2,
-            self.settings.default_line_y2,
-        )
+                log.exception("Failed to build polygon zone %r", name)
+        return out
 
-    def _reset_line_zone(self) -> None:
-        self._line_zone = None
-        self._line_dirty = True
+    def _resolve_settings(self) -> tuple[float, float, int]:
+        """Detection settings with per-camera overrides on top of globals."""
+        s = self.settings
+        conf = self.state.confidence if self.state.confidence is not None else s.confidence
+        iou = self.state.iou if self.state.iou is not None else s.iou
+        imgsz = self.state.imgsz if self.state.imgsz is not None else s.image_size
+        return float(conf), float(iou), int(imgsz)
 
-    def _build_line_zone(self, width: int, height: int) -> sv.LineZone:
-        start, end = self.state.line.to_pixels(width, height)
-        return sv.LineZone(
-            start=start,
-            end=end,
-            minimum_crossing_threshold=self.settings.min_crossing_threshold,
-        )
+    def _resolve_tracker_name(self) -> str:
+        return (self.state.tracker or self.settings.tracker or "botsort_reid")
 
     def _load_model(self) -> YOLO:
-        import os
-
         device = _resolve_device(self.settings.device)
         self.state.status.device = device
 
@@ -324,50 +617,52 @@ class Counter:
             candidates.append(self.settings.fallback_model_name)
 
         models_dir = self.settings.models_dir
-        prev_cwd = os.getcwd()
         last_err: Exception | None = None
 
-        try:
-            # Ultralytics downloads weights into CWD; chdir into models dir
-            # so any auto-download lands there alongside cached weights.
-            os.chdir(models_dir)
-            for name in candidates:
-                try:
-                    log.info("Loading YOLO model %s on %s", name, device)
-                    weight_path = models_dir / name
-                    model_arg = str(weight_path) if weight_path.is_file() else name
-                    model = YOLO(model_arg)
-                    dummy = np.zeros(
-                        (self.settings.image_size, self.settings.image_size, 3),
-                        dtype=np.uint8,
-                    )
-                    model.predict(
-                        dummy,
-                        device=device,
-                        imgsz=self.settings.image_size,
-                        verbose=False,
-                    )
-                    self.state.status.model_name = name
-                    return model
-                except Exception as e:  # noqa: BLE001
-                    log.warning("Failed to load model %s: %s", name, e)
-                    last_err = e
-        finally:
+        with self._model_load_lock:
+            prev_cwd = os.getcwd()
             try:
-                os.chdir(prev_cwd)
-            except OSError:
-                pass
+                os.chdir(models_dir)
+                for name in candidates:
+                    try:
+                        log.info(
+                            "[%s] Loading YOLO model %s on %s",
+                            self.camera_id[:8], name, device,
+                        )
+                        weight_path = models_dir / name
+                        model_arg = str(weight_path) if weight_path.is_file() else name
+                        model = YOLO(model_arg)
+                        _, _, imgsz = self._resolve_settings()
+                        dummy = np.zeros((imgsz, imgsz, 3), dtype=np.uint8)
+                        model.predict(
+                            dummy,
+                            device=device,
+                            imgsz=imgsz,
+                            verbose=False,
+                        )
+                        self.state.status.model_name = name
+                        return model
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("Failed to load model %s: %s", name, e)
+                        last_err = e
+            finally:
+                try:
+                    os.chdir(prev_cwd)
+                except OSError:
+                    pass
 
         raise RuntimeError(f"Could not load any YOLO model: {last_err}")
 
     def _run(self) -> None:
-        log.info("Counter thread starting")
+        log.info("[%s] Counter thread starting", self.camera_id[:8])
         try:
             model = self._load_model()
             self.state.status.model_loaded = True
+            self.state.status.last_error = None
         except Exception as e:  # noqa: BLE001
-            log.exception("Model load failed")
+            log.exception("[%s] Model load failed", self.camera_id[:8])
             self.state.status.last_error = f"model: {e}"
+            self.state.status.model_loaded = False
             self._broadcast_state()
             return
 
@@ -377,24 +672,29 @@ class Counter:
             try:
                 self._inference_loop(model)
             except Exception as e:  # noqa: BLE001
-                log.exception("Inference loop crashed; restarting in 2s")
+                log.exception(
+                    "[%s] Inference loop crashed; restarting in 2s",
+                    self.camera_id[:8],
+                )
                 self.state.status.last_error = str(e)
                 self.state.status.camera_open = False
                 self.state.status.running = False
                 self._broadcast_state()
-                # Avoid hot loop on persistent failures.
                 if self._stop_event.wait(2.0):
                     break
 
-        log.info("Counter thread exiting")
+        log.info("[%s] Counter thread exiting", self.camera_id[:8])
 
     def _inference_loop(self, model: YOLO) -> None:
+        is_video = self.state.kind == "video" or _looks_like_video_file(self.state.source)
         cap = _open_capture(
-            self.settings.source,
+            self.state.source,
             self.settings.capture_width,
             self.settings.capture_height,
             self.settings.target_fps,
+            is_video_file=is_video,
         )
+
         try:
             actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or self.settings.capture_width
             actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or self.settings.capture_height
@@ -403,6 +703,13 @@ class Counter:
             self.state.status.camera_open = True
             self.state.status.running = True
             self.state.status.last_error = None
+            self.state.status.is_video_file = is_video
+
+            video_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0) if is_video else 0.0
+            video_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0) if is_video else 0
+            self.state.status.video_fps = video_fps
+            self.state.status.video_total_frames = video_total
+            self.state.status.video_position = 0
             self._broadcast_state()
 
             box_annotator = sv.BoxAnnotator(thickness=2)
@@ -411,20 +718,57 @@ class Counter:
                 thickness=3, text_thickness=2, text_scale=0.7
             )
             trace_annotator = sv.TraceAnnotator(thickness=2, trace_length=30)
+            zone_annotators: dict[str, sv.PolygonZoneAnnotator] = {}
 
-            line_zone: sv.LineZone | None = None
-            cached_line_dim = (-1, -1)
-            cached_line_cfg: dict[str, float] | None = None
-
+            cached_dim = (-1, -1)
             consecutive_fails = 0
             fps_window: list[float] = []
             last_t = time.time()
+            frame_period = 1.0 / video_fps if video_fps > 1.0 else 0.0
+            playback_anchor = time.time()
+
+            # Smoother is rebuilt per-loop because length is global.
+            sm_len = max(0, int(self.settings.smoother_length))
+            self._smoother = sv.DetectionsSmoother(length=sm_len) if sm_len > 0 else None
+
+            tracker_path = _resolve_tracker_path(self._resolve_tracker_name(), self.settings)
+            self.state.status.tracker = Path(tracker_path).stem
 
             while not self._stop_event.is_set():
+                # External restart request (e.g. after a seek/restart) — break to
+                # re-enter the inference loop with a fresh capture.
+                if self._restart_event.is_set():
+                    self._restart_event.clear()
+                    break
+
+                # Pause for video sources.
+                if self.state.paused and is_video:
+                    if self._stop_event.wait(0.1):
+                        break
+                    playback_anchor = time.time()  # don't accumulate sleep debt
+                    continue
+
                 ok, frame = cap.read()
                 if not ok or frame is None:
+                    if is_video:
+                        # End of file.
+                        if self.state.loop_video:
+                            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                            playback_anchor = time.time()
+                            continue
+                        # No loop -> stay idle but keep last frame visible until restart.
+                        self.state.paused = True
+                        self.state.status.paused = True
+                        self._broadcast_state()
+                        if self._stop_event.wait(0.2):
+                            break
+                        continue
+
                     consecutive_fails += 1
-                    log.warning("Camera read failed (%s)", consecutive_fails)
+                    log.warning(
+                        "[%s] Camera read failed (%s)",
+                        self.camera_id[:8], consecutive_fails,
+                    )
                     if consecutive_fails >= self.settings.max_camera_failures:
                         raise RuntimeError("Too many consecutive camera read failures")
                     if self._stop_event.wait(0.05):
@@ -432,43 +776,51 @@ class Counter:
                     continue
                 consecutive_fails = 0
 
-                if self.settings.mirror:
+                if self.state.mirror:
                     frame = cv2.flip(frame, 1)
 
                 fh, fw = frame.shape[:2]
-                current_cfg = self.state.line.as_dict()
                 if (
-                    line_zone is None
-                    or cached_line_dim != (fw, fh)
-                    or cached_line_cfg != current_cfg
-                    or getattr(self, "_line_dirty", False)
+                    self._dirty_geometry
+                    or cached_dim != (fw, fh)
+                    or not self._line_zones
                 ):
-                    line_zone = self._build_line_zone(fw, fh)
-                    cached_line_dim = (fw, fh)
-                    cached_line_cfg = current_cfg
-                    self._line_dirty = False
+                    self._line_zones = self._build_line_zones(fw, fh)
+                    self._zone_states = self._build_polygon_zones(fw, fh)
+                    zone_annotators = {
+                        name: sv.PolygonZoneAnnotator(zone=zone, color=sv.Color.GREEN, thickness=2)
+                        for name, zone in self._zone_states.items()
+                    }
+                    cached_dim = (fw, fh)
+                    self._dirty_geometry = False
 
-                # Only run heavy detection when we're actively counting OR a preview
-                # client is watching. We always run detection here because the preview
-                # is the source of truth for what's about to be counted.
+                conf, iou, imgsz = self._resolve_settings()
+
                 results = model.track(
                     frame,
                     persist=True,
-                    tracker="bytetrack.yaml",
+                    tracker=tracker_path,
                     classes=[self.settings.person_class_id],
-                    conf=self.settings.confidence,
-                    iou=self.settings.iou,
-                    imgsz=self.settings.image_size,
+                    conf=conf,
+                    iou=iou,
+                    imgsz=imgsz,
+                    max_det=self.settings.max_det,
                     device=self.state.status.device,
                     verbose=False,
                 )
                 detections = sv.Detections.from_ultralytics(results[0])
 
-                # Filter: tracker_id is required for LineZone counting.
                 if detections.tracker_id is None:
                     detections = detections[np.array([], dtype=int)]
                 else:
                     detections = detections[detections.tracker_id != None]  # noqa: E711
+
+                if self._smoother is not None and len(detections) > 0:
+                    try:
+                        detections = self._smoother.update_with_detections(detections)
+                    except Exception:
+                        log.exception("smoother failed; disabling for this loop")
+                        self._smoother = None
 
                 annotated = frame.copy()
                 if len(detections) > 0:
@@ -477,20 +829,42 @@ class Counter:
                     labels = self._make_labels(detections)
                     annotated = label_annotator.annotate(annotated, detections, labels=labels)
 
-                # Trigger line zone always so counts update; we conditionally
-                # persist them (and emit events) only when a session is active.
-                crossed_in, crossed_out = line_zone.trigger(detections)
-                annotated = line_annotator.annotate(annotated, line_zone)
+                # Counting per line (each line maintains its own dedup set).
+                events_buffer: list[tuple[str, int, str]] = []
+                for line_name, line_zone in self._line_zones.items():
+                    crossed_in, crossed_out = line_zone.trigger(detections)
+                    annotated = line_annotator.annotate(annotated, line_zone)
+                    if not (self._counting_event.is_set() and self.state.session_id):
+                        continue
+                    in_seen = self._tracked_in_per_line.setdefault(line_name, set())
+                    out_seen = self._tracked_out_per_line.setdefault(line_name, set())
+                    new_in = self._collect_crossed_ids(detections, crossed_in, in_seen)
+                    new_out = self._collect_crossed_ids(detections, crossed_out, out_seen)
+                    for tid in new_in:
+                        events_buffer.append(("in", tid, line_name))
+                    for tid in new_out:
+                        events_buffer.append(("out", tid, line_name))
 
-                if self._counting_event.is_set() and self.state.session_id:
-                    new_in_ids = self._collect_crossed_ids(detections, crossed_in, self._tracked_ids_in)
-                    new_out_ids = self._collect_crossed_ids(detections, crossed_out, self._tracked_ids_out)
-                    if new_in_ids or new_out_ids:
-                        self._record_crossings(new_in_ids, new_out_ids)
+                # Polygon zones — visualize and update occupancy. Zones don't
+                # generate count events directly; they're observability surface
+                # for the operator (interior occupancy, entry queue, etc.).
+                zone_counts: dict[str, int] = {}
+                for zone_name, zone in self._zone_states.items():
+                    mask = zone.trigger(detections)
+                    zone_counts[zone_name] = int(mask.sum()) if mask is not None else 0
+                    ann = zone_annotators.get(zone_name)
+                    if ann is not None:
+                        try:
+                            annotated = ann.annotate(annotated, label=str(zone_counts[zone_name]))
+                        except Exception:
+                            log.exception("zone annotator failed")
+                self.state.zone_counts = zone_counts
+
+                if events_buffer:
+                    self._record_crossings(events_buffer)
 
                 self._encode_preview(annotated)
 
-                # FPS tracking.
                 now = time.time()
                 fps_window.append(now - last_t)
                 last_t = now
@@ -499,6 +873,22 @@ class Counter:
                 avg = sum(fps_window) / len(fps_window) if fps_window else 0
                 self.state.status.fps = (1.0 / avg) if avg > 0 else 0.0
                 self.state.status.last_frame_at = now
+
+                if is_video:
+                    self.state.status.video_position = int(
+                        cap.get(cv2.CAP_PROP_POS_FRAMES) or 0
+                    )
+                    if frame_period > 0:
+                        # Pace playback to the file's native FPS so detection
+                        # timing matches what a live camera would look like.
+                        playback_anchor += frame_period
+                        delay = playback_anchor - time.time()
+                        if delay > 0:
+                            if self._stop_event.wait(min(delay, 1.0)):
+                                break
+                        elif delay < -1.0:
+                            # Fell badly behind — resync rather than spin forever.
+                            playback_anchor = time.time()
 
         finally:
             cap.release()
@@ -523,19 +913,20 @@ class Counter:
                     new_ids.append(tid)
         return new_ids
 
-    def _record_crossings(self, new_in: list[int], new_out: list[int]) -> None:
-        if not self.state.session_id:
+    def _record_crossings(self, events: list[tuple[str, int, str]]) -> None:
+        if not self.state.session_id or not events:
             return
-        events: list[dict[str, Any]] = []
+        emitted: list[dict[str, Any]] = []
         with self._lock:
-            for tid in new_in:
-                self.state.in_count += 1
-                event = self.storage.append_event(self.state.session_id, "in", tid)
-                events.append(event)
-            for tid in new_out:
-                self.state.out_count += 1
-                event = self.storage.append_event(self.state.session_id, "out", tid)
-                events.append(event)
+            for kind, tid, line_name in events:
+                if kind == "in":
+                    self.state.in_count += 1
+                else:
+                    self.state.out_count += 1
+                event = self.storage.append_event(
+                    self.state.session_id, kind, tid, line_name=line_name
+                )
+                emitted.append(event)
 
             inside = self.state.inside
             if inside > self.state.peak_inside:
@@ -548,12 +939,11 @@ class Counter:
                 self.state.peak_inside,
             )
 
-        for event in events:
+        for event in emitted:
             self._broadcast_event(event)
         self._broadcast_state()
 
     def _encode_preview(self, frame: np.ndarray) -> None:
-        # Resize down to ~1280px-wide for cheaper encoding if necessary.
         h, w = frame.shape[:2]
         max_w = 1280
         if w > max_w:
@@ -587,7 +977,7 @@ class Counter:
             listeners = list(self._event_listeners)
         for cb in listeners:
             try:
-                cb(event)
+                cb(self.camera_id, event)
             except Exception:
                 log.exception("Event listener failed")
 
@@ -597,6 +987,6 @@ class Counter:
             listeners = list(self._state_listeners)
         for cb in listeners:
             try:
-                cb(snapshot)
+                cb(self.camera_id, snapshot)
             except Exception:
                 log.exception("State listener failed")

@@ -1,0 +1,23 @@
+# BoT-SORT with ReID tuned for indoor people counting at doorways.
+# - track_buffer: 60 keeps a track alive ~2s at 30fps so brief occlusion (someone
+#   walking in front of someone else) doesn't spawn a new ID.
+# - with_reid + native features (model: auto) reuses detector features for ReID
+#   without an extra model load — small CPU/GPU cost, big win on identity stability.
+# - gmc_method: sparseOptFlow handles slight handheld/PTZ jitter on indoor cams.
+# - higher new_track_thresh and match_thresh reduce spurious tracks from partial
+#   detections at the edge of the field of view.
+
+tracker_type: botsort
+track_high_thresh: 0.30
+track_low_thresh: 0.10
+new_track_thresh: 0.40
+track_buffer: 60
+match_thresh: 0.85
+fuse_score: True
+
+gmc_method: sparseOptFlow
+
+proximity_thresh: 0.5
+appearance_thresh: 0.7
+with_reid: True
+model: auto

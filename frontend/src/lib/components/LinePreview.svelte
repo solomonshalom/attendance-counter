@@ -1,9 +1,31 @@
 <script>
 // @ts-nocheck
 import { onMount, onDestroy } from 'svelte';
-import { PREVIEW_URL, api } from '../api.js';
+import { previewUrl, api } from '../api.js';
 
-let { line, frameWidth = 1280, frameHeight = 720, cameraOpen = true } = $props();
+let {
+	cameraId,
+	line,
+	lines = [],
+	zones = [],
+	frameWidth = 1280,
+	frameHeight = 720,
+	cameraOpen = true,
+	cameraRunning = true,
+	lastError = null
+} = $props();
+
+const otherLines = $derived(
+	(lines || []).filter((l, i) => i > 0 && l && (l.x1 !== line?.x1 || l.y1 !== line?.y1 || l.x2 !== line?.x2 || l.y2 !== line?.y2))
+);
+const polygonStrings = $derived.by(() => {
+	const w = renderedSize?.width || 1;
+	const h = renderedSize?.height || 1;
+	return (zones || []).map((z) => {
+		const pts = (z?.polygon || []).map((p) => `${(p.x ?? 0) * w},${(p.y ?? 0) * h}`).join(' ');
+		return { name: z?.name ?? '', role: z?.role ?? 'observer', points: pts };
+	});
+});
 
 let containerEl;
 let imgEl = $state(null);
@@ -29,6 +51,8 @@ const renderedSize = $derived.by(() => {
 	return { width: cw, height: ch };
 });
 
+const streamUrl = $derived(cameraId ? previewUrl(cameraId) : '');
+
 let resizeObserver;
 
 onMount(() => {
@@ -47,11 +71,10 @@ onDestroy(() => {
 
 function handleImgError() {
 	imageError = true;
-	// Retry the stream after a short delay (network glitch, sleep/wake, etc.)
 	setTimeout(() => {
-		if (imgEl) {
+		if (imgEl && cameraOpen) {
 			imageError = false;
-			imgEl.src = `${PREVIEW_URL}?t=${Date.now()}`;
+			imgEl.src = `${streamUrl}?t=${Date.now()}`;
 		}
 	}, 1500);
 }
@@ -69,6 +92,7 @@ function cancelEditing() {
 }
 
 async function saveLine() {
+	if (!cameraId) return;
 	saving = true;
 	saveError = null;
 	try {
@@ -78,7 +102,7 @@ async function saveLine() {
 			x2: clamp01(pendingLine.x2),
 			y2: clamp01(pendingLine.y2)
 		};
-		await api.setLine(clamped);
+		await api.setLine(cameraId, clamped);
 		editing = false;
 		dragHandle = null;
 	} catch (err) {
@@ -93,7 +117,7 @@ function clamp01(v) {
 }
 
 function eventToNorm(e) {
-	const rect = imgEl.getBoundingClientRect();
+	const rect = imgEl?.getBoundingClientRect() ?? containerEl.getBoundingClientRect();
 	const px = ('clientX' in e) ? e.clientX : (e.touches?.[0]?.clientX ?? 0);
 	const py = ('clientY' in e) ? e.clientY : (e.touches?.[0]?.clientY ?? 0);
 	const x = (px - rect.left) / Math.max(1, rect.width);
@@ -141,10 +165,10 @@ const linePixels = $derived.by(() => {
 	const h = renderedSize.height;
 	const src = editing ? pendingLine : line;
 	return {
-		x1: src.x1 * w,
-		y1: src.y1 * h,
-		x2: src.x2 * w,
-		y2: src.y2 * h
+		x1: (src?.x1 ?? 0.5) * w,
+		y1: (src?.y1 ?? 0) * h,
+		x2: (src?.x2 ?? 0.5) * w,
+		y2: (src?.y2 ?? 1) * h
 	};
 });
 </script>
@@ -183,13 +207,27 @@ const linePixels = $derived.by(() => {
 		class="preview-container"
 		style:aspect-ratio="{aspect}"
 	>
-		{#if !cameraOpen}
+		{#if !cameraRunning}
 			<div class="preview-fallback">
 				<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none">
-					<path d="M1 1l22 22M21 21H3a2 2 0 01-2-2V5M5 5h2l2-3h6l2 3h4a2 2 0 012 2v9.34" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+					<rect x="3" y="6" width="14" height="12" rx="2" stroke="currentColor" stroke-width="2"/>
+					<path d="M21 9l-4 3 4 3V9z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
 				</svg>
-				<p>Camera not connected</p>
-				<small>Check the camera index in <code>counter/.env</code> and restart the counter service.</small>
+				<p>Camera stopped</p>
+				<small>Press <strong>Start</strong> in the camera row to begin streaming.</small>
+			</div>
+		{:else if !cameraOpen}
+			<div class="preview-fallback">
+				{#if lastError}
+					<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none">
+						<path d="M1 1l22 22M21 21H3a2 2 0 01-2-2V5M5 5h2l2-3h6l2 3h4a2 2 0 012 2v9.34" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+					</svg>
+					<p>Camera unavailable</p>
+					<small>{lastError}</small>
+				{:else}
+					<div class="spinner"></div>
+					<p>Connecting to camera…</p>
+				{/if}
 			</div>
 		{:else if imageError}
 			<div class="preview-fallback">
@@ -199,14 +237,14 @@ const linePixels = $derived.by(() => {
 		{:else}
 			<img
 				bind:this={imgEl}
-				src={PREVIEW_URL}
+				src={streamUrl}
 				alt="Live counter preview"
 				draggable="false"
 				onerror={handleImgError}
 			/>
 		{/if}
 
-		{#if cameraOpen && !imageError}
+		{#if cameraOpen && cameraRunning && !imageError}
 			<svg
 				class="overlay"
 				class:editing
@@ -217,6 +255,32 @@ const linePixels = $derived.by(() => {
 				onpointercancel={onPointerUp}
 				role={editing ? 'application' : 'presentation'}
 			>
+				<!-- Read-only polygon zones -->
+				{#each polygonStrings as z}
+					{#if z.points}
+						<polygon
+							points={z.points}
+							fill="rgba(40, 167, 69, 0.10)"
+							stroke="rgba(40, 167, 69, 0.85)"
+							stroke-width="2"
+							stroke-dasharray="6 4"
+						/>
+					{/if}
+				{/each}
+
+				<!-- Secondary lines -->
+				{#each otherLines as ol}
+					<line
+						x1={(ol.x1 ?? 0) * (renderedSize.width || 1)}
+						y1={(ol.y1 ?? 0) * (renderedSize.height || 1)}
+						x2={(ol.x2 ?? 0) * (renderedSize.width || 1)}
+						y2={(ol.y2 ?? 0) * (renderedSize.height || 1)}
+						stroke="rgba(255, 214, 51, 0.85)"
+						stroke-width="2"
+						stroke-dasharray="6 4"
+					/>
+				{/each}
+
 				<line
 					x1={linePixels.x1}
 					y1={linePixels.y1}
@@ -320,6 +384,7 @@ const linePixels = $derived.by(() => {
 	font-weight: 500;
 	cursor: pointer;
 	transition: opacity 0.15s ease;
+	font-family: inherit;
 }
 
 .btn-light-pill {
@@ -379,14 +444,12 @@ const linePixels = $derived.by(() => {
 }
 
 .preview-fallback small {
-	color: rgba(255, 255, 255, 0.6);
+	color: rgba(255, 255, 255, 0.7);
 	max-width: 360px;
 }
 
-.preview-fallback code {
-	background: rgba(255, 255, 255, 0.12);
-	padding: 1px 6px;
-	border-radius: 4px;
+.preview-fallback strong {
+	color: #fff;
 }
 
 .spinner {

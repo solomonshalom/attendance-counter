@@ -1,0 +1,452 @@
+/* Dark-mode overrides for the attendance-counter UI.
+ *
+ * Applied via html[data-theme="dark"] — set synchronously by an inline script
+ * in app.html (so there's no flash of light theme) and by the theme store.
+ *
+ * The selectors use html[data-theme="dark"] .class to beat Svelte's scoped
+ * styles in specificity: scoped is .class.svelte-hash (0,2,0); ours is
+ * type + attr + class (0,2,1) and wins.
+ */
+
+html[data-theme="dark"] {
+  color-scheme: dark;
+}
+
+html[data-theme="dark"] body {
+  background-color: #0f1115;
+  color: #e9ecef;
+}
+
+/* ---------- text ---------- */
+html[data-theme="dark"] .dash-title,
+html[data-theme="dark"] .cam-title,
+html[data-theme="dark"] .cameras-title,
+html[data-theme="dark"] .preview-title,
+html[data-theme="dark"] .combined-title,
+html[data-theme="dark"] .cam-name,
+html[data-theme="dark"] .dialog-head h2 {
+  color: #e9ecef;
+}
+
+html[data-theme="dark"] .dash-sub,
+html[data-theme="dark"] .cameras-sub,
+html[data-theme="dark"] .combined-sub,
+html[data-theme="dark"] .cam-meta,
+html[data-theme="dark"] .cam-sub,
+html[data-theme="dark"] .feed-time,
+html[data-theme="dark"] .field-help,
+html[data-theme="dark"] .field-label,
+html[data-theme="dark"] .checkbox,
+html[data-theme="dark"] .toggle,
+html[data-theme="dark"] .toggle-label,
+html[data-theme="dark"] .dash-footer,
+html[data-theme="dark"] .history-empty,
+html[data-theme="dark"] .empty-state,
+html[data-theme="dark"] .cameras-empty {
+  color: #adb5bd;
+}
+
+html[data-theme="dark"] .feed-track,
+html[data-theme="dark"] .feed-empty {
+  color: #6c757d;
+}
+
+html[data-theme="dark"] .history-table th {
+  color: #adb5bd;
+}
+
+/* ---------- surfaces ---------- */
+html[data-theme="dark"] .history-card,
+html[data-theme="dark"] .camera-card,
+html[data-theme="dark"] .feed-card,
+html[data-theme="dark"] .cameras-card,
+html[data-theme="dark"] .preview-card,
+html[data-theme="dark"] .empty-state,
+html[data-theme="dark"] .dialog {
+  background: #1a1d22;
+  border-color: #2e3137;
+}
+
+html[data-theme="dark"] .history-empty,
+html[data-theme="dark"] .cameras-empty,
+html[data-theme="dark"] .feed-empty {
+  border-color: #2e3137;
+}
+
+html[data-theme="dark"] .history-table th,
+html[data-theme="dark"] .history-table td {
+  border-bottom-color: #2a2d33;
+}
+
+html[data-theme="dark"] .history-table tr.active td {
+  background: #2e2615;
+}
+
+html[data-theme="dark"] .dot-inline {
+  background: #51cf66;
+}
+
+html[data-theme="dark"] .cam-row {
+  border-color: #2e3137;
+}
+
+html[data-theme="dark"] .feed-item {
+  border-bottom-color: #2a2d33;
+}
+
+html[data-theme="dark"] .dash-footer {
+  border-top-color: #2e3137;
+}
+
+/* ---------- code/source pills ---------- */
+html[data-theme="dark"] .cam-source-pill code,
+html[data-theme="dark"] .cam-source code {
+  background: #2a2d33;
+  color: #adb5bd;
+}
+
+/* ---------- inputs ---------- */
+html[data-theme="dark"] .cam-input,
+html[data-theme="dark"] .field input {
+  background: #22262c;
+  color: #e9ecef;
+  border-color: #3a3d42;
+}
+
+html[data-theme="dark"] .field input:focus {
+  border-color: #e9ecef;
+}
+
+html[data-theme="dark"] .cam-input:disabled,
+html[data-theme="dark"] .field input:disabled {
+  background: #1a1d22;
+  color: #6c757d;
+}
+
+/* ---------- buttons ---------- */
+/* primary inverts: dark-on-light → light-on-dark */
+html[data-theme="dark"] .btn-primary-pill,
+html[data-theme="dark"] .btn-dark-pill {
+  background: #e9ecef;
+  color: rgb(33, 37, 41);
+  border-color: #e9ecef;
+}
+
+/* light becomes outline */
+html[data-theme="dark"] .btn-light-pill {
+  background: transparent;
+  color: #e9ecef;
+  border-color: #e9ecef;
+}
+
+html[data-theme="dark"] .btn-danger-pill {
+  background: #dc3545;
+  color: #fff;
+  border-color: #dc3545;
+}
+
+html[data-theme="dark"] .icon-btn {
+  background: transparent;
+  color: #adb5bd;
+  border-color: #3a3d42;
+}
+
+html[data-theme="dark"] .icon-btn:hover:not(:disabled) {
+  background: #2a2d33;
+}
+
+html[data-theme="dark"] .icon-btn-danger {
+  color: #ff8a95;
+  border-color: #6b2530;
+}
+
+html[data-theme="dark"] .icon-btn-danger:hover:not(:disabled) {
+  background: #3d1a1f;
+}
+
+html[data-theme="dark"] .close-btn {
+  background: transparent;
+  color: #adb5bd;
+  border-color: #3a3d42;
+}
+
+html[data-theme="dark"] .close-btn:hover:not(:disabled) {
+  background: #2a2d33;
+}
+
+/* ---------- badges ---------- */
+html[data-theme="dark"] .badge-ok {
+  background: #1d3a2a;
+  color: #8ce0a8;
+  border-color: #2d5540;
+}
+
+html[data-theme="dark"] .badge-warn {
+  background: #3d3415;
+  color: #ffd966;
+  border-color: #5e521f;
+}
+
+html[data-theme="dark"] .badge-err {
+  background: #3d1a1f;
+  color: #ff8a95;
+  border-color: #6b2530;
+}
+
+html[data-theme="dark"] .badge-muted {
+  background: #2a2d33;
+  color: #adb5bd;
+  border-color: #3a3d42;
+}
+
+html[data-theme="dark"] .badge-active {
+  background: #e9ecef;
+  color: rgb(33, 37, 41);
+  border-color: #e9ecef;
+}
+
+html[data-theme="dark"] .cam-count,
+html[data-theme="dark"] .feed-count,
+html[data-theme="dark"] .combined-pill {
+  background: #e9ecef;
+  color: rgb(33, 37, 41);
+}
+
+/* ---------- error banners ---------- */
+html[data-theme="dark"] .cam-action-error,
+html[data-theme="dark"] .cameras-error,
+html[data-theme="dark"] .dialog-error,
+html[data-theme="dark"] .preview-error,
+html[data-theme="dark"] .cam-err {
+  background: #3d1a1f;
+  color: #ff8a95;
+  border-color: #6b2530;
+}
+
+html[data-theme="dark"] .cam-sub-error {
+  color: #ff8a95;
+}
+
+/* ---------- count cards ---------- */
+html[data-theme="dark"] .count-card {
+  border-color: #2e3137;
+}
+
+html[data-theme="dark"] .count-card-in {
+  background: #1a2942;
+  border-color: #2c4870;
+  color: #cfe2ff;
+}
+
+html[data-theme="dark"] .count-card-out {
+  background: #3d1a1f;
+  border-color: #6b2530;
+  color: #f5c2c7;
+}
+
+html[data-theme="dark"] .count-card-inside {
+  background: #3d3415;
+  border-color: #5e521f;
+  color: #ffe69c;
+}
+
+/* peak inverts to light card so it still stands out */
+html[data-theme="dark"] .count-card-peak {
+  background: #e9ecef;
+  color: rgb(33, 37, 41);
+  border-color: #e9ecef;
+}
+
+/* ---------- feed pills ---------- */
+html[data-theme="dark"] .feed-kind-in {
+  background: #1a3a40;
+  color: #8eddef;
+}
+
+html[data-theme="dark"] .feed-kind-out {
+  background: #3d1a1f;
+  color: #ff8a95;
+}
+
+/* ---------- combined card border (uses accent color in light) ---------- */
+html[data-theme="dark"] .combined-card {
+  border-color: #e9ecef;
+}
+
+/* ---------- preview help ---------- */
+html[data-theme="dark"] .preview-help {
+  background: #2e2615;
+  color: #ffe69c;
+}
+
+/* ---------- modal ---------- */
+html[data-theme="dark"] .backdrop {
+  background: rgba(0, 0, 0, 0.7);
+}
+
+html[data-theme="dark"] .dialog {
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
+}
+
+/* ---------- combine-totals toggle switch ---------- */
+html[data-theme="dark"] .toggle-track {
+  background: #3a3d42;
+}
+
+html[data-theme="dark"] .toggle-thumb {
+  background: #adb5bd;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+}
+
+html[data-theme="dark"] .toggle input:checked + .toggle-track {
+  background: #e9ecef;
+}
+
+html[data-theme="dark"] .toggle input:checked + .toggle-track .toggle-thumb {
+  background: rgb(33, 37, 41);
+}
+
+html[data-theme="dark"] .toggle input:focus-visible + .toggle-track {
+  outline-color: #e9ecef;
+}
+
+/* ---------- theme toggle button (dark variant) ---------- */
+html[data-theme="dark"] .theme-toggle {
+  border-color: #3a3d42;
+  background: transparent;
+  color: #adb5bd;
+}
+
+html[data-theme="dark"] .theme-toggle:hover {
+  background: #2a2d33;
+  color: #e9ecef;
+}
+
+/* ---------- mobile sticky bottom bar (.dash-meta is fixed below 640px) ---------- */
+@media (max-width: 640px) {
+  html[data-theme="dark"] .dash-meta {
+    background: rgba(15, 17, 21, 0.92);
+    border-top-color: #2e3137;
+    box-shadow: 0 -2px 8px rgba(0, 0, 0, 0.4);
+  }
+}
+
+/* ---------- new in 1.1: dialog tabs, video list, settings panel ---------- */
+html[data-theme="dark"] .kind-tabs {
+  background: #2a2d33;
+}
+
+html[data-theme="dark"] .kind-tab {
+  color: #adb5bd;
+}
+
+html[data-theme="dark"] .kind-tab.active {
+  background: #e9ecef;
+  color: rgb(33, 37, 41);
+}
+
+html[data-theme="dark"] .video-list {
+  border-color: #3a3d42;
+}
+
+html[data-theme="dark"] .video-row {
+  color: #e9ecef;
+}
+
+html[data-theme="dark"] .video-row:hover {
+  background: #2a2d33;
+}
+
+html[data-theme="dark"] .video-row.active {
+  background: #2e2615;
+}
+
+html[data-theme="dark"] .video-name {
+  color: #adb5bd;
+}
+
+html[data-theme="dark"] .video-size,
+html[data-theme="dark"] .upload-help,
+html[data-theme="dark"] .video-empty {
+  color: #adb5bd;
+}
+
+html[data-theme="dark"] .video-empty {
+  border-color: #3a3d42;
+}
+
+html[data-theme="dark"] .progress {
+  background: #2a2d33;
+}
+
+html[data-theme="dark"] .progress-bar {
+  background: #e9ecef;
+}
+
+/* ---------- playback bar (video-source CameraCard) ---------- */
+html[data-theme="dark"] .playback-bar {
+  background: #22262c;
+  border-color: #3a3d42;
+  color: #adb5bd;
+}
+
+html[data-theme="dark"] .playback-bar .pb-time {
+  color: #adb5bd;
+}
+
+html[data-theme="dark"] .playback-bar .pb-source,
+html[data-theme="dark"] .playback-bar .pb-loop {
+  color: #6c757d;
+}
+
+html[data-theme="dark"] .pb-btn {
+  background: #1a1d22;
+  color: #adb5bd;
+  border-color: #3a3d42;
+}
+
+html[data-theme="dark"] .pb-btn:hover:not(:disabled) {
+  background: #2a2d33;
+  color: #e9ecef;
+}
+
+html[data-theme="dark"] .pb-track {
+  background: #2a2d33;
+}
+
+html[data-theme="dark"] .pb-track-fill {
+  background: #e9ecef;
+}
+
+html[data-theme="dark"] .pb-error {
+  background: #3d1a1f;
+  color: #ff8a95;
+  border-color: #6b2530;
+}
+
+/* ---------- per-camera settings panel ---------- */
+html[data-theme="dark"] .settings-panel {
+  background: #22262c;
+  border-color: #3a3d42;
+}
+
+html[data-theme="dark"] .settings-panel input,
+html[data-theme="dark"] .settings-panel select {
+  background: #1a1d22;
+  color: #e9ecef;
+  border-color: #3a3d42;
+}
+
+html[data-theme="dark"] .settings-panel .settings-help,
+html[data-theme="dark"] .settings-panel .settings-label {
+  color: #adb5bd;
+}
+
+html[data-theme="dark"] .settings-toggle {
+  color: #adb5bd;
+  border-color: #3a3d42;
+}
+
+html[data-theme="dark"] .settings-toggle:hover {
+  background: #2a2d33;
+}

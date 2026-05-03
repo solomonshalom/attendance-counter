@@ -1,10 +1,15 @@
 /**
  * WebSocket client with automatic reconnect and exponential backoff.
- * Falls back to long-polling /api/state if the WS handshake repeatedly fails.
+ * Falls back to long-polling /api/cameras if the WS handshake repeatedly fails.
  */
 
 import { browser } from '$app/environment';
-import { connectionStatus, counterState, pushEvent } from './stores.js';
+import {
+	connectionStatus,
+	pushEvent,
+	replaceCameras,
+	upsertCamera
+} from './stores.js';
 import { api } from './api.js';
 
 const RECONNECT_BASE_MS = 500;
@@ -71,9 +76,11 @@ class CounterClient {
 			try {
 				const msg = JSON.parse(e.data);
 				if (msg.type === 'state' && msg.data) {
-					counterState.set(msg.data);
-				} else if (msg.type === 'event' && msg.data) {
-					pushEvent(msg.data);
+					upsertCamera(msg.data);
+				} else if (msg.type === 'event' && msg.data && msg.camera_id) {
+					pushEvent(msg.camera_id, msg.data);
+				} else if (msg.type === 'cameras' && Array.isArray(msg.data)) {
+					replaceCameras(msg.data);
 				}
 			} catch (err) {
 				console.warn('Bad WS message', err);
@@ -108,8 +115,8 @@ class CounterClient {
 		if (this.pollTimer) return;
 		const tick = async () => {
 			try {
-				const state = await api.getState();
-				counterState.set(state);
+				const list = await api.listCameras();
+				if (Array.isArray(list)) replaceCameras(list);
 			} catch {
 				// keep retrying silently
 			}
