@@ -4,6 +4,7 @@ import { onMount } from 'svelte';
 import { api } from '../api.js';
 import { venues } from '../stores.js';
 import VenueDialog from './VenueDialog.svelte';
+import VisitorFlowCard from './VisitorFlowCard.svelte';
 
 let { cameras = [] } = $props();
 
@@ -106,29 +107,34 @@ function calibratedCount(venueId) {
 					{@const cams = camerasInVenue(v.id)}
 					{@const calCount = calibratedCount(v.id)}
 					<li class="venue-row">
-						<div class="venue-info">
-							<div class="venue-name-row">
-								<span class="venue-name">{v.name}</span>
-								<span class="venue-pill">{v.floor_plan_w_m} × {v.floor_plan_h_m} m</span>
+						<div class="venue-row-main">
+							<div class="venue-info">
+								<div class="venue-name-row">
+									<span class="venue-name">{v.name}</span>
+									<span class="venue-pill">{v.floor_plan_w_m} × {v.floor_plan_h_m} m</span>
+								</div>
+								<div class="venue-meta">
+									{cams.length} camera{cams.length === 1 ? '' : 's'}
+									· {calCount}/{cams.length} calibrated
+									· dedupe ≤ {v.dedup_window_s}s, {v.dedup_radius_m}m
+								</div>
 							</div>
-							<div class="venue-meta">
-								{cams.length} camera{cams.length === 1 ? '' : 's'}
-								· {calCount}/{cams.length} calibrated
-								· dedupe ≤ {v.dedup_window_s}s, {v.dedup_radius_m}m
+							<div class="venue-actions">
+								<button class="btn-light-pill btn-sm" onclick={() => openEdit(v)} disabled={busy}>
+									<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none">
+										<path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7M18.5 2.5a2.121 2.121 0 113 3L12 15l-4 1 1-4 9.5-9.5z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+									</svg>
+									Edit
+								</button>
+								<button class="icon-btn icon-btn-danger" title="Delete venue" onclick={() => deleteVenue(v)} disabled={busy} aria-label="Delete venue">
+									<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none">
+										<path d="M19 7L18.13 19.14C18.06 20.19 17.19 21 16.14 21H7.86C6.81 21 5.94 20.19 5.87 19.14L5 7M10 11v6M14 11v6M15 7V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+									</svg>
+								</button>
 							</div>
 						</div>
-						<div class="venue-actions">
-							<button class="btn-light-pill btn-sm" onclick={() => openEdit(v)} disabled={busy}>
-								<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none">
-									<path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7M18.5 2.5a2.121 2.121 0 113 3L12 15l-4 1 1-4 9.5-9.5z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-								</svg>
-								Edit
-							</button>
-							<button class="icon-btn icon-btn-danger" title="Delete venue" onclick={() => deleteVenue(v)} disabled={busy} aria-label="Delete venue">
-								<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none">
-									<path d="M19 7L18.13 19.14C18.06 20.19 17.19 21 16.14 21H7.86C6.81 21 5.94 20.19 5.87 19.14L5 7M10 11v6M14 11v6M15 7V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-								</svg>
-							</button>
+						<div class="venue-row-flow">
+							<VisitorFlowCard venue={v} />
 						</div>
 					</li>
 				{/each}
@@ -232,13 +238,24 @@ function calibratedCount(venueId) {
 
 .venue-row {
 	display: flex;
-	justify-content: space-between;
-	align-items: flex-start;
+	flex-direction: column;
 	gap: 12px;
 	padding: 12px;
 	border: 2px solid #f1f3f5;
 	border-radius: 12px;
+}
+
+.venue-row-main {
+	display: flex;
+	justify-content: space-between;
+	align-items: flex-start;
+	gap: 12px;
 	flex-wrap: wrap;
+}
+
+.venue-row-flow {
+	border-top: 1px dashed #e9ecef;
+	padding-top: 12px;
 }
 
 .venue-info {

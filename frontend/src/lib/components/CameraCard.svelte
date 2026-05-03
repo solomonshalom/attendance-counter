@@ -7,6 +7,7 @@ import LinePreview from './LinePreview.svelte';
 import PlaybackControls from './PlaybackControls.svelte';
 import SettingsPanel from './SettingsPanel.svelte';
 import CalibrationDialog from './CalibrationDialog.svelte';
+import HealthBadge from './HealthBadge.svelte';
 
 let { camera } = $props();
 
@@ -99,6 +100,7 @@ function startSessionDisabledReason() {
 					<div class="cam-title-row">
 						<h2 class="cam-title">{camera?.camera_name}</h2>
 						<span class="cam-source-pill"><code>{camera?.source}</code></span>
+						<HealthBadge {camera} />
 					</div>
 					{#if camera?.session_id}
 						<div class="cam-sub">

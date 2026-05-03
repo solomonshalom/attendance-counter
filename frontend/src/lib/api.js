@@ -165,7 +165,37 @@ export const api = {
 		});
 	},
 	deleteVideo: (/** @type {string} */ filename) =>
-		request(`/api/videos/${encodeURIComponent(filename)}`, { method: 'DELETE' })
+		request(`/api/videos/${encodeURIComponent(filename)}`, { method: 'DELETE' }),
+
+	// ---- metrics & health ----
+	getMetrics: () => request('/api/metrics'),
+	getHealthLive: () => request('/api/health/live'),
+	getHealthReady: () =>
+		fetch(`${BASE}/api/health/ready`).then(async (r) => ({
+			ok: r.ok,
+			body: await r.json().catch(() => null)
+		})),
+
+	// ---- identity (P9) ----
+	getVenuePeopleStats: (/** @type {string} */ venueId) =>
+		request(`/api/venues/${venueId}/people/stats`),
+	purgeVenueFaceData: (/** @type {string} */ venueId) =>
+		request(
+			`/api/admin/face-data/purge?venue_id=${encodeURIComponent(venueId)}`,
+			{ method: 'POST' }
+		),
+	purgeExpiredFaces: () =>
+		request('/api/admin/face-data/purge-expired', { method: 'POST' }),
+	forgetPerson: async (/** @type {string} */ venueId, /** @type {File|Blob} */ file) => {
+		const fd = new FormData();
+		fd.append('file', file);
+		const res = await fetch(`${BASE}/api/venues/${venueId}/people/forget`, {
+			method: 'POST',
+			body: fd
+		});
+		await ensureOk(res);
+		return res.json();
+	}
 };
 
 /** @param {string} cameraId */
