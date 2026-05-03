@@ -108,10 +108,17 @@ function onKey(e) {
 				<div class="dedup-card">
 					<div class="dedup-head">Cross-camera dedupe</div>
 					<div class="dedup-help">
-						When two cameras in this venue see the same person crossing within a
-						short time + space window, the second event is suppressed from the
-						live count. Tighter windows = stricter; loosen if you have wide-angle
+						When two cameras in this venue see the same person crossing within
+						this time + space window, the second event is suppressed from the
+						live count. Tighter = stricter; loosen if you have wide-angle
 						cameras with overlapping coverage.
+					</div>
+					<div class="dedup-help">
+						<strong>Note:</strong> dedupe handles <em>spatial overlap</em>
+						(two cameras pointed at the same doorway). For non-overlapping
+						cameras (e.g. one at each end of a long corridor), put count lines
+						on only ONE of them — otherwise the same person walking through
+						will be counted at each.
 					</div>
 					<div class="grid-2">
 						<label class="field">

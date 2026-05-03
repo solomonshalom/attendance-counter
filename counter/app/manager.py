@@ -544,32 +544,28 @@ class CameraManager:
         """Compute homography from `points` and persist alongside the points.
 
         Each point is `{img: {x, y}, world: {x, y}}` where `img` is normalized
-        [0,1] and `world` is meters in the venue's floor plan.
-        Returns the calibration record with computed homography + reprojection
-        error, then triggers a counter rebuild so the new H is hot-loaded.
+        [0,1] and `world` is meters in the venue's floor plan. We compute H
+        directly in NORMALIZED image coords → meters, so the calibration is
+        independent of the camera's pixel resolution. At inference time the
+        bbox anchor is normalized by the current frame size before applying H,
+        meaning a camera can change resolution (or even be replaced with a
+        different physical camera at the same vantage point) without breaking
+        the world-position math.
+
+        Reprojection error > 2 m is rejected with a 400 — the dedupe radius is
+        ≤ 10 m by API limit, so a 2 m+ fit would silently kill cross-camera
+        dedupe accuracy.
         """
         if len(points) < 4:
             raise ValueError("Calibration needs at least 4 point pairs")
-
-        # Convert image-normalized points to pixels using the camera's current
-        # frame size; if the counter isn't running yet we fall back to the
-        # configured capture resolution.
-        with self._lock:
-            counter = self._counters.get(camera_id)
-            if counter is not None:
-                fw = counter.state.status.frame_width or self.settings.capture_width
-                fh = counter.state.status.frame_height or self.settings.capture_height
-            else:
-                fw = self.settings.capture_width
-                fh = self.settings.capture_height
 
         try:
             import cv2  # local import keeps cold-start light
         except ImportError as e:
             raise RuntimeError("opencv missing") from e
 
-        img_px = np.array(
-            [[float(p["img"]["x"]) * fw, float(p["img"]["y"]) * fh] for p in points],
+        img_norm = np.array(
+            [[float(p["img"]["x"]), float(p["img"]["y"])] for p in points],
             dtype=np.float32,
         )
         world = np.array(
@@ -577,16 +573,68 @@ class CameraManager:
             dtype=np.float32,
         )
 
-        H, mask = cv2.findHomography(img_px, world, method=cv2.RANSAC, ransacReprojThreshold=5.0)
+        # Reject geometrically-poor point sets. With exactly 4 pairs,
+        # findHomography fits ANY 4 points perfectly (8 DOF, 8 constraints).
+        # The H can be valid mathematically but useless in practice if the
+        # input points are clustered or near-collinear.
+        #   1. Spread per axis ≥ 30% of frame.
+        #   2. Convex-hull area ≥ 0.03 of the unit square (rejects near-
+        #      collinear sets where 3 of the 4 points sit on one line).
+        img_span_x = float(img_norm[:, 0].max() - img_norm[:, 0].min())
+        img_span_y = float(img_norm[:, 1].max() - img_norm[:, 1].min())
+        if img_span_x < 0.3 or img_span_y < 0.3:
+            raise ValueError(
+                f"Calibration points are clustered (spread {img_span_x:.0%} × "
+                f"{img_span_y:.0%} of the frame). Spread them to at least 4 "
+                f"corners of the visible area so the homography reflects the "
+                f"real viewing angle."
+            )
+
+        # Minimum triangle area across all 3-point subsets. Three points on a
+        # single line yield triangle area 0; this catches sets where 3+ of
+        # the points are collinear even though the 4th adds spread.
+        from itertools import combinations
+        def _tri_area(p1: np.ndarray, p2: np.ndarray, p3: np.ndarray) -> float:
+            return 0.5 * abs(
+                (p2[0] - p1[0]) * (p3[1] - p1[1])
+                - (p3[0] - p1[0]) * (p2[1] - p1[1])
+            )
+
+        min_tri = min(
+            _tri_area(*combo) for combo in combinations(img_norm.tolist(), 3)
+        )
+        if min_tri < 0.005:
+            raise ValueError(
+                f"Three or more calibration points lie on a single line "
+                f"(min triangle area {min_tri:.4f}). Pick landmarks that form "
+                f"a proper quadrilateral on the floor — e.g. corners of a "
+                f"rug, base of pillars, or doorway corners."
+            )
+
+        # RANSAC threshold is in normalized image units now, not pixels.
+        # 0.01 ≈ 1% of frame width, ≈ 19 px on a 1920-wide frame — generous
+        # enough to absorb hand-marked imprecision but tight enough to flag
+        # mismarked landmarks.
+        H, mask = cv2.findHomography(
+            img_norm, world, method=cv2.RANSAC, ransacReprojThreshold=0.01
+        )
         if H is None:
             raise ValueError(
                 "Could not compute homography from these points. Make sure they "
                 "lie on a single plane (the floor) and aren't collinear."
             )
 
-        projected = cv2.perspectiveTransform(img_px.reshape(-1, 1, 2), H).reshape(-1, 2)
+        projected = cv2.perspectiveTransform(img_norm.reshape(-1, 1, 2), H).reshape(-1, 2)
         errors = np.linalg.norm(projected - world, axis=1)
         mean_error_m = float(errors.mean())
+
+        if mean_error_m > 2.0:
+            raise ValueError(
+                f"Calibration fit is too loose (mean error {mean_error_m:.2f} m). "
+                "Re-mark points: pick landmarks that are clearly on the floor "
+                "(not at different heights) and avoid clustering them in one "
+                "corner of the frame."
+            )
 
         with self._lock:
             calib = self.storage.save_calibration(

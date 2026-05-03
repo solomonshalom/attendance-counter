@@ -412,6 +412,20 @@ async def delete_video(filename: str) -> dict[str, str]:
     target = (settings.videos_dir / safe).resolve()
     if not target.is_file() or settings.videos_dir.resolve() not in target.parents:
         raise HTTPException(status_code=404, detail="Video not found")
+    # Refuse if any camera is currently using this file as its source — silent
+    # deletion would leave the camera retrying read failures forever.
+    target_str = str(target)
+    in_use = [
+        c for c in _manager(app).list_cameras()
+        if (c.get("source") or "") == target_str
+    ]
+    if in_use:
+        names = ", ".join(c["camera_name"] for c in in_use)
+        raise HTTPException(
+            status_code=409,
+            detail=f"Video is in use by camera(s): {names}. "
+                   f"Delete or repoint those cameras first.",
+        )
     target.unlink()
     return {"status": "deleted"}
 
@@ -487,6 +501,7 @@ async def set_calibration(camera_id: str, req: CalibrationRequest) -> dict[str, 
     try:
         return _manager(app).set_calibration(camera_id, points)
     except ValueError as e:
+        # `set_calibration` rejects degenerate points and high-error fits.
         raise HTTPException(status_code=400, detail=str(e))
 
 

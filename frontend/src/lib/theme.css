@@ -484,6 +484,10 @@ html[data-theme="dark"] .zone-help {
   color: #ffe69c;
 }
 
+html[data-theme="dark"] .zone-field-help {
+  color: #adb5bd;
+}
+
 html[data-theme="dark"] .zone-danger {
   color: #ff8a95;
   border-color: #6b2530;

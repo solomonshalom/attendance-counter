@@ -346,15 +346,24 @@ class Counter:
         self._dedupe_check: Callable[[str, float | None, float | None, float], bool] | None = None
         self._dedupe_record: Callable[[str, float, float, float], None] | None = None
 
-        # Per-line dedup (set of tracker_ids that have already been counted in/out
-        # on a specific named line during the current session).
-        self._tracked_in_per_line: dict[str, set[int]] = {}
-        self._tracked_out_per_line: dict[str, set[int]] = {}
         self._line_zones: dict[str, sv.LineZone] = {}
         self._dirty_geometry = True
 
-        # Track-state machine for polygon zones (interior occupancy etc.)
+        # Polygon zones for occupancy display (all zones) and counting
+        # (zones with role='interior'). The state machine below is what makes
+        # interior zones generate in/out events.
         self._zone_states: dict[str, sv.PolygonZone] = {}
+        self._zone_roles: dict[str, str] = {}
+        # For each interior zone, tracker_ids currently considered "inside",
+        # plus a per-tracker persistence counter (positive = consecutive frames
+        # seen inside, negative = consecutive frames missing). This filters
+        # detection flicker without losing legitimate transitions.
+        self._zone_inside_ids: dict[str, set[int]] = {}
+        self._zone_persist: dict[str, dict[int, int]] = {}
+        # Last known world position per (zone, tracker) so an "out" event still
+        # carries a world position for cross-camera dedupe even when the
+        # tracker is no longer detected anywhere on screen.
+        self._zone_last_pos: dict[str, dict[int, tuple[float, float]]] = {}
 
         # Smoother for stable bboxes/anchor positions across frames.
         self._smoother: sv.DetectionsSmoother | None = None
@@ -480,8 +489,11 @@ class Counter:
             self.state.in_count = 0
             self.state.out_count = 0
             self.state.peak_inside = 0
-            self._tracked_in_per_line.clear()
-            self._tracked_out_per_line.clear()
+            # Reset zone-state machine so people already on screen at session
+            # start have to actually transition to be counted.
+            self._zone_inside_ids.clear()
+            self._zone_persist.clear()
+            self._zone_last_pos.clear()
             self._dirty_geometry = True
             self._counting_event.set()
         self._broadcast_state()
@@ -511,8 +523,9 @@ class Counter:
             self.state.in_count = 0
             self.state.out_count = 0
             self.state.peak_inside = 0
-            self._tracked_in_per_line.clear()
-            self._tracked_out_per_line.clear()
+            self._zone_inside_ids.clear()
+            self._zone_persist.clear()
+            self._zone_last_pos.clear()
             self._dirty_geometry = True
             if self.state.session_id:
                 self.storage.update_session_counts(
@@ -530,8 +543,6 @@ class Counter:
                 self.state.lines = [line]
             self.storage.set_camera_line(self.camera_id, line.as_dict())
             self._dirty_geometry = True
-            self._tracked_in_per_line.clear()
-            self._tracked_out_per_line.clear()
         self._broadcast_state()
 
     def set_lines(self, lines: list[LineConfig]) -> None:
@@ -544,8 +555,6 @@ class Counter:
                 self.camera_id, [ln.as_dict() for ln in lines]
             )
             self._dirty_geometry = True
-            self._tracked_in_per_line.clear()
-            self._tracked_out_per_line.clear()
         self._broadcast_state()
 
     def set_zones(self, zones: list[ZoneConfig]) -> None:
@@ -554,6 +563,10 @@ class Counter:
             self.storage.replace_zones(
                 self.camera_id, [z.as_dict() for z in zones]
             )
+            # Geometry rebuild also rebuilds the zone-state machine state.
+            self._zone_inside_ids.clear()
+            self._zone_persist.clear()
+            self._zone_last_pos.clear()
             self._dirty_geometry = True
         self._broadcast_state()
 
@@ -597,6 +610,7 @@ class Counter:
 
     def _build_polygon_zones(self, width: int, height: int) -> dict[str, sv.PolygonZone]:
         out: dict[str, sv.PolygonZone] = {}
+        roles: dict[str, str] = {}
         names_seen: set[str] = set()
         for z in self.state.zones:
             if len(z.polygon) < 3:
@@ -614,8 +628,11 @@ class Counter:
                     polygon=pts,
                     triggering_anchors=(sv.Position.BOTTOM_CENTER,),
                 )
+                roles[name] = z.role or "observer"
             except Exception:
                 log.exception("Failed to build polygon zone %r", name)
+        # Replace role map atomically so the inference loop sees a coherent set.
+        self._zone_roles = roles
         return out
 
     def _resolve_settings(self) -> tuple[float, float, int]:
@@ -850,42 +867,56 @@ class Counter:
                     labels = self._make_labels(detections)
                     annotated = label_annotator.annotate(annotated, detections, labels=labels)
 
-                # Counting per line (each line maintains its own dedup set).
+                # Counting per line. sv.LineZone's minimum_crossing_threshold
+                # already filters bbox jitter; we simply emit one event per
+                # `crossed` mask entry. Back-and-forth movement legitimately
+                # produces multiple events (in → out → in), which is correct
+                # for occupancy tracking.
                 # Each entry is (kind, tracker_id, line_name, world_x|None, world_y|None).
                 events_buffer: list[tuple[str, int, str, float | None, float | None]] = []
+                counting_active = self._counting_event.is_set() and self.state.session_id
+
                 for line_name, line_zone in self._line_zones.items():
                     crossed_in, crossed_out = line_zone.trigger(detections)
                     annotated = line_annotator.annotate(annotated, line_zone)
-                    if not (self._counting_event.is_set() and self.state.session_id):
+                    if not counting_active:
                         continue
-                    in_seen = self._tracked_in_per_line.setdefault(line_name, set())
-                    out_seen = self._tracked_out_per_line.setdefault(line_name, set())
-                    new_in_pairs = self._collect_crossed_pairs(
-                        detections, crossed_in, in_seen
-                    )
-                    new_out_pairs = self._collect_crossed_pairs(
-                        detections, crossed_out, out_seen
-                    )
-                    for tid, det_idx in new_in_pairs:
+                    for tid, det_idx in self._collect_crossed_pairs(detections, crossed_in):
                         wx, wy = self._world_pos(detections, det_idx)
                         events_buffer.append(("in", tid, line_name, wx, wy))
-                    for tid, det_idx in new_out_pairs:
+                    for tid, det_idx in self._collect_crossed_pairs(detections, crossed_out):
                         wx, wy = self._world_pos(detections, det_idx)
                         events_buffer.append(("out", tid, line_name, wx, wy))
 
-                # Polygon zones — visualize and update occupancy. Zones don't
-                # generate count events directly; they're observability surface
-                # for the operator (interior occupancy, entry queue, etc.).
+                # Polygon zones: occupancy display for all zones, plus a
+                # state-machine counter for zones with role='interior'. The
+                # state machine emits "in" the first time a tracker has been
+                # seen inside for `min_crossing_threshold` consecutive frames,
+                # and "out" the first time it's been absent for the same
+                # number of frames after being inside. This gives reliable
+                # entry counts even without a precisely-placed line — useful
+                # for rooms with no clear doorway boundary.
                 zone_counts: dict[str, int] = {}
+                threshold = max(1, self.settings.min_crossing_threshold)
                 for zone_name, zone in self._zone_states.items():
                     mask = zone.trigger(detections)
-                    zone_counts[zone_name] = int(mask.sum()) if mask is not None else 0
+                    count_now = int(mask.sum()) if mask is not None else 0
+                    zone_counts[zone_name] = count_now
                     ann = zone_annotators.get(zone_name)
                     if ann is not None:
                         try:
-                            annotated = ann.annotate(annotated, label=str(zone_counts[zone_name]))
+                            annotated = ann.annotate(annotated, label=str(count_now))
                         except Exception:
                             log.exception("zone annotator failed")
+
+                    role = self._zone_roles.get(zone_name, "observer")
+                    if role != "interior" or not counting_active:
+                        continue
+
+                    self._update_zone_state_machine(
+                        zone_name, detections, mask, threshold, events_buffer
+                    )
+
                 self.state.zone_counts = zone_counts
 
                 if events_buffer:
@@ -928,31 +959,106 @@ class Counter:
     def _collect_crossed_pairs(
         detections: sv.Detections,
         crossed_mask: Iterable[bool],
-        seen: set[int],
     ) -> list[tuple[int, int]]:
-        """Return list of (tracker_id, detection_index) for crossings not yet seen."""
+        """Return list of (tracker_id, detection_index) for everything that
+        crossed THIS frame. sv.LineZone's internal threshold filters jitter;
+        the mask is sparse (only true on the actual crossing frame), so a
+        legitimate back-and-forth will produce multiple separate events."""
         if detections.tracker_id is None:
             return []
         out: list[tuple[int, int]] = []
         for det_idx, (tracker_id, crossed) in enumerate(zip(detections.tracker_id, crossed_mask)):
             if crossed and tracker_id is not None:
-                tid = int(tracker_id)
-                if tid not in seen:
-                    seen.add(tid)
-                    out.append((tid, det_idx))
+                out.append((int(tracker_id), det_idx))
         return out
+
+    def _update_zone_state_machine(
+        self,
+        zone_name: str,
+        detections: sv.Detections,
+        mask: np.ndarray | None,
+        threshold: int,
+        events_buffer: list[tuple[str, int, str, float | None, float | None]],
+    ) -> None:
+        """Track entry/exit transitions for a single interior zone.
+
+        State per tracker_id, kept across frames:
+          - persist > 0: that many consecutive frames seen inside
+          - persist < 0: that many consecutive frames missing (after having
+            been inside)
+        A tracker enters the zone's "inside" set when persist hits +threshold;
+        it leaves when persist hits -threshold. Once an in/out transition
+        fires, persist resets to ±1 in the matching direction so back-to-back
+        re-entries within the same session legitimately count again."""
+        persist = self._zone_persist.setdefault(zone_name, {})
+        inside = self._zone_inside_ids.setdefault(zone_name, set())
+        last_pos = self._zone_last_pos.setdefault(zone_name, {})
+
+        # Tracker IDs visible inside the polygon this frame.
+        now_inside_ids: set[int] = set()
+        if detections.tracker_id is not None and mask is not None:
+            for det_idx, in_zone in enumerate(mask):
+                tid = detections.tracker_id[det_idx]
+                if in_zone and tid is not None:
+                    tid_i = int(tid)
+                    now_inside_ids.add(tid_i)
+                    # Cache last known position so an "out" event still has
+                    # world coords for cross-camera dedup, even if the tracker
+                    # is no longer visible.
+                    wx, wy = self._world_pos(detections, det_idx)
+                    if wx is not None and wy is not None:
+                        last_pos[tid_i] = (wx, wy)
+
+                    persist[tid_i] = max(0, persist.get(tid_i, 0)) + 1
+                    if persist[tid_i] >= threshold and tid_i not in inside:
+                        inside.add(tid_i)
+                        events_buffer.append(("in", tid_i, f"zone:{zone_name}", wx, wy))
+
+        # Trackers that were inside but aren't in this frame: count down.
+        for tid_i in list(inside):
+            if tid_i in now_inside_ids:
+                continue
+            persist[tid_i] = min(0, persist.get(tid_i, 0)) - 1
+            if persist[tid_i] <= -threshold:
+                inside.discard(tid_i)
+                # Don't pop persist here — keep the negative counter so a
+                # quick re-entry doesn't re-trigger from stale positive count.
+                persist[tid_i] = 0
+                wx, wy = last_pos.pop(tid_i, (None, None))
+                events_buffer.append(("out", tid_i, f"zone:{zone_name}", wx, wy))
+
+        # Garbage-collect stale persist entries we know nothing about anymore
+        # (not inside, not now-detected, fully decayed). Bound is implicit but
+        # this keeps the dict small for long sessions.
+        if len(persist) > 1024:
+            for tid_i in list(persist.keys()):
+                if (
+                    tid_i not in inside
+                    and tid_i not in now_inside_ids
+                    and persist[tid_i] == 0
+                ):
+                    del persist[tid_i]
 
     def _world_pos(
         self, detections: sv.Detections, det_idx: int
     ) -> tuple[float | None, float | None]:
         """Project a detection's BOTTOM_CENTER anchor through the camera's
-        homography matrix, returning meters in the venue's floor plane."""
+        homography (which expects normalized [0..1] image coords), returning
+        meters in the venue's floor plane.
+
+        Normalizing here makes the calibration resolution-independent: the
+        same H works regardless of how the camera reports its frame size.
+        """
         if self._homography is None:
+            return (None, None)
+        fw = self.state.status.frame_width
+        fh = self.state.status.frame_height
+        if fw <= 0 or fh <= 0:
             return (None, None)
         try:
             box = detections.xyxy[det_idx]
-            bx = float((box[0] + box[2]) / 2.0)
-            by = float(box[3])
+            bx = float((box[0] + box[2]) / 2.0) / fw
+            by = float(box[3]) / fh
             pt = np.array([[[bx, by]]], dtype=np.float64)
             world = cv2.perspectiveTransform(pt, self._homography)
             return float(world[0][0][0]), float(world[0][0][1])

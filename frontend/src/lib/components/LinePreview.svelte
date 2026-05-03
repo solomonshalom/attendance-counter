@@ -163,10 +163,10 @@ let drawingMode = $state(false); // when true, clicks on the canvas add vertices
 let zoneDrag = $state(null);
 
 const ROLE_OPTIONS = [
-	{ value: 'interior', label: 'Interior (room body)' },
-	{ value: 'entry', label: 'Entry (lobby/foyer)' },
-	{ value: 'exit', label: 'Exit (vestibule)' },
-	{ value: 'observer', label: 'Observer (watch only)' }
+	{ value: 'interior', label: 'Interior — counts entries/exits' },
+	{ value: 'entry', label: 'Entry — display only' },
+	{ value: 'exit', label: 'Exit — display only' },
+	{ value: 'observer', label: 'Observer — display only' }
 ];
 
 function addZone() {
@@ -671,6 +671,11 @@ const selectedZone = $derived(selectedZoneIdx >= 0 ? pendingZones[selectedZoneId
 								<option value={opt.value}>{opt.label}</option>
 							{/each}
 						</select>
+						<span class="zone-field-help">
+							{selectedZone.role === 'interior'
+								? 'Each tracker entering this polygon emits an in event; leaving emits an out event. Use this for rooms with no clear doorway line.'
+								: 'This zone is shown on the preview and reports occupancy, but does not affect counts. Use a line or an interior zone to count.'}
+						</span>
 					</label>
 
 					<div class="zone-controls">
@@ -990,6 +995,12 @@ const selectedZone = $derived(selectedZoneIdx >= 0 ? pendingZones[selectedZoneId
 	font-weight: 600;
 	font-size: 12px;
 	color: #495057;
+}
+
+.zone-field-help {
+	font-size: 11px;
+	color: #6c757d;
+	line-height: 1.4;
 }
 
 .zone-field input,
