@@ -22,6 +22,7 @@ from .config import Settings
 from .inference import ModelRegistry, resolve_device as _resolve_device_helper
 from .inference.registry import resolve_fp16
 from .storage import Storage
+from .tracking import SlicerDetector
 
 log = logging.getLogger("counter")
 
@@ -324,6 +325,12 @@ class Counter:
         # FP16 flag, resolved by the registry at model-load time. Read by the
         # inference loop's model.track call.
         self._fp16: bool = False
+
+        # Slicer detector — only constructed when settings.slicer_enabled, in
+        # which case it OWNS the per-camera tracker (sv.ByteTrack). When the
+        # slicer is disabled (default), tracking is via model.track(persist=True)
+        # with BoT-SORT-ReID inside ultralytics.
+        self._slicer_detector: SlicerDetector | None = None
 
         # ----- Crossing-gate state -----
         # Per-tracker recent history: deque of (frame_idx, x_norm, y_norm, conf).
@@ -894,26 +901,53 @@ class Counter:
                 # state.status.device may be "<dev>/fp16" cosmetically; the
                 # actual ultralytics device arg must be the bare device name.
                 device_arg = self.state.status.device.split("/")[0]
-                results = model.track(
-                    frame,
-                    persist=True,
-                    tracker=tracker_path,
-                    classes=[self.settings.person_class_id],
-                    conf=conf,
-                    iou=iou,
-                    imgsz=imgsz,
-                    max_det=self.settings.max_det,
-                    device=device_arg,
-                    half=self._fp16,
-                    verbose=False,
-                )
-                detections = sv.Detections.from_ultralytics(results[0])
+
+                if self.settings.slicer_enabled:
+                    # Tile-based path: split frame, predict per tile, NMS-merge,
+                    # then per-camera ByteTrack assigns IDs. We rebuild the
+                    # SlicerDetector when predict args have drifted (per-camera
+                    # override edits), since the slicer captures them at
+                    # construction time.
+                    sig = (conf, iou, imgsz, device_arg, self._fp16)
+                    if (
+                        self._slicer_detector is None
+                        or self._slicer_detector.params_signature() != sig
+                    ):
+                        self._slicer_detector = SlicerDetector(
+                            settings=self.settings,
+                            model=model,
+                            person_class_id=self.settings.person_class_id,
+                            conf=conf,
+                            iou=iou,
+                            imgsz=imgsz,
+                            device=device_arg,
+                            fp16=self._fp16,
+                        )
+                    detections = self._slicer_detector.infer(frame)
+                else:
+                    # Direct path: model.track keeps BoT-SORT-ReID state on the
+                    # ultralytics predictor, giving us ReID across brief
+                    # occlusions for the typical doorway camera shot.
+                    results = model.track(
+                        frame,
+                        persist=True,
+                        tracker=tracker_path,
+                        classes=[self.settings.person_class_id],
+                        conf=conf,
+                        iou=iou,
+                        imgsz=imgsz,
+                        max_det=self.settings.max_det,
+                        device=device_arg,
+                        half=self._fp16,
+                        verbose=False,
+                    )
+                    detections = sv.Detections.from_ultralytics(results[0])
 
                 # Drop anything without a tracker_id — line/zone counters need stable
-                # IDs to debounce. Ultralytics' from_ultralytics() returns either
-                # tracker_id=None (no tracking yet) or an int ndarray (all valid),
-                # but we stay defensive against other integrations that might
-                # produce object arrays with None entries.
+                # IDs to debounce. Both paths above can produce tracker_id=None
+                # (slicer's ByteTrack on its very first call, or model.track
+                # before initial track binding); we stay defensive against
+                # object-array None entries from any integration.
                 if detections.tracker_id is None:
                     detections = sv.Detections.empty()
                 elif detections.tracker_id.dtype == object:

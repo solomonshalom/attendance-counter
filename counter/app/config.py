@@ -51,6 +51,27 @@ class Settings(BaseSettings):
     # Number of frames for DetectionsSmoother. 0 disables smoothing.
     smoother_length: int = 3
 
+    # ----- Tile-based inference (sv.InferenceSlicer) -----
+    # Slices each frame into overlapping tiles, runs inference per tile, and
+    # merges the results. Detects small / distant people that nano YOLO would
+    # miss on a single full-frame predict — at the cost of N × inference time
+    # per frame (where N = number of tiles).
+    #
+    # Trade-off worth it for: wide-angle cameras viewing >10 m halls where
+    # people in the back rows occupy < 40 px tall. NOT worth it for tight
+    # doorway shots where people are already ~150 px tall — slicing there
+    # just adds latency without finding new detections.
+    #
+    # Currently a global flag; per-camera override is a follow-on. Slicer
+    # mode forces per-camera tracking via sv.ByteTrack (no ReID); the trade
+    # of ReID for slicer accuracy is intentional for distant scenes where
+    # brief-occlusion ReID helps less anyway.
+    slicer_enabled: bool = False
+    slicer_tile_size: int = 640
+    slicer_overlap: int = 100
+    slicer_iou_threshold: float = 0.5
+    slicer_thread_workers: int = 1
+
     # Stream sizing for preview & inference.
     capture_width: int = 1280
     capture_height: int = 720
