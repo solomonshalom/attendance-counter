@@ -157,6 +157,85 @@ async def metrics() -> dict[str, Any]:
     return _manager(app).metrics()
 
 
+# ----------------------------------------------------------------- people / identity
+
+
+@app.get("/api/venues/{venue_id}/people/stats")
+async def venue_people_stats(venue_id: str) -> dict[str, Any]:
+    """Visitor analytics for a venue: total people, first-timers vs
+    returning, last activity, opted-out count.
+
+    Returns 404 if the venue doesn't exist. The numbers reflect what's
+    currently in the encrypted store — auto-purged rows are gone.
+    """
+    if not _manager(app).get_venue(venue_id):
+        raise HTTPException(status_code=404, detail="Venue not found")
+    store = _manager(app)._identity_store
+    return store.stats(venue_id)
+
+
+@app.post("/api/venues/{venue_id}/people/forget")
+async def venue_people_forget(
+    venue_id: str, file: UploadFile = File(...)
+) -> dict[str, Any]:
+    """Opt-out kiosk endpoint. Accepts a single image (JPEG/PNG); we
+    extract the largest face's embedding, hash it into the venue's
+    do-not-store list, and purge any matching person rows.
+
+    The uploaded image is processed in memory and discarded — never
+    written to disk.
+    """
+    if not _manager(app).get_venue(venue_id):
+        raise HTTPException(status_code=404, detail="Venue not found")
+    pipeline = _manager(app)._identity_pipeline
+    if not pipeline.is_available():
+        raise HTTPException(
+            status_code=503,
+            detail="Identity pipeline not available (insightface missing or failed to load)",
+        )
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="empty upload")
+    if len(raw) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="image > 10 MB")
+
+    import cv2
+    import numpy as np
+
+    arr = np.frombuffer(raw, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise HTTPException(status_code=400, detail="could not decode image")
+
+    purged = pipeline.opt_out_from_image(img, venue_id)
+    return {"venue_id": venue_id, "people_purged": purged, "added_to_blocklist": True}
+
+
+@app.post("/api/admin/face-data/purge")
+async def admin_purge_face_data(venue_id: str) -> dict[str, Any]:
+    """Emergency wipe of ALL face data for a venue. Overwrites embeddings
+    with random bytes before deletion to defeat WAL/snapshot recovery.
+
+    Intended for incident response / GDPR / BIPA delete-all requests at
+    the venue level. Does NOT touch crossing events — those remain (with
+    person_id stale references). Use carefully.
+    """
+    if not _manager(app).get_venue(venue_id):
+        raise HTTPException(status_code=404, detail="Venue not found")
+    store = _manager(app)._identity_store
+    purged = store.admin_purge_venue(venue_id)
+    return {"venue_id": venue_id, "people_purged": purged}
+
+
+@app.post("/api/admin/face-data/purge-expired")
+async def admin_purge_expired() -> dict[str, Any]:
+    """Run the retention sweeper now. Normally called from a cron / loop;
+    exposed manually for ops convenience."""
+    purged = _manager(app)._identity_store.purge_expired()
+    return {"people_purged": purged}
+
+
 # ----------------------------------------------------------------- cameras
 
 

@@ -10,3 +10,15 @@ pydantic-settings>=2.6.0
 torch>=2.5.0
 torchvision>=0.20.0
 lap>=0.5.12
+
+# Encryption-at-rest for face embeddings (P9). Small (≈ 5 MB) pure-python
+# binding to OpenSSL. Used by counter/app/identity/store.py for AES-GCM.
+cryptography>=44.0.0
+
+# Face detection + ArcFace-style embeddings for venue-wide persistent
+# identity (P9). Soft-required: if onnxruntime / insightface are missing
+# at runtime, the identity layer logs a warning at boot and stays inert
+# rather than crashing the rest of the counter. Ships its own model
+# downloads on first use.
+insightface>=0.7.3
+onnxruntime>=1.20.0

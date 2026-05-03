@@ -20,6 +20,7 @@ from .counter import (
     ZoneConfig,
     _looks_like_video_file,
 )
+from .identity import IdentityPipeline, IdentityStore
 from .inference import ModelRegistry
 from .storage import Storage
 from .tracking import GlobalTracker
@@ -172,6 +173,17 @@ class CameraManager:
         # Counter that has a homography + venue assignment, returns the
         # bound global_id so events can be tagged with cross-camera identity.
         self._global_tracker = GlobalTracker()
+
+        # Persistent identity (face). Encrypted-at-rest store + insightface
+        # pipeline. Both load lazily — boot doesn't pay any insightface cost
+        # unless face_identity_enabled and a Counter actually uses it.
+        self._identity_store = IdentityStore(
+            db_path=settings.face_db_path,
+            key_dir=settings.face_keys_dir,
+        )
+        self._identity_pipeline = IdentityPipeline(
+            settings=settings, store=self._identity_store
+        )
 
         self._event_listeners: list[EventCallback] = []
         self._state_listeners: list[StateCallback] = []
@@ -619,6 +631,16 @@ class CameraManager:
         if removed:
             self._deduper.remove_venue(venue_id)
             self._global_tracker.remove_venue(venue_id)
+            # Purge face data with this venue. We do this defensively even
+            # though the cameras have been detached: orphan face rows pinned
+            # to a deleted venue would just be inaccessible cruft.
+            try:
+                self._identity_store.admin_purge_venue(venue_id)
+            except Exception:
+                log.exception(
+                    "failed to purge identity data for deleted venue %s",
+                    venue_id,
+                )
             self._broadcast_camera_list()
         return removed
 
@@ -828,6 +850,7 @@ class CameraManager:
             venue_id=venue_id,
             homography=homography,
             registry=self._registry,
+            identity_pipeline=self._identity_pipeline,
         )
 
         # Wire dedupe callbacks: counter consults the deduper before persisting

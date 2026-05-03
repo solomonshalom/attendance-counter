@@ -266,6 +266,7 @@ class Counter:
         venue_id: str | None = None,
         homography: np.ndarray | None = None,
         registry: "ModelRegistry | None" = None,
+        identity_pipeline: "Any | None" = None,
     ) -> None:
         self.camera_id = camera_id
         self.settings = settings
@@ -274,6 +275,10 @@ class Counter:
         # if not injected so single-Counter test paths still work.
         from .inference import ModelRegistry as _MR
         self._registry = registry if registry is not None else _MR(settings)
+        # Optional persistent-identity pipeline. None when face identity is
+        # disabled globally or insightface isn't installed. Counter falls
+        # through gracefully — global_id alone still works.
+        self._identity_pipeline = identity_pipeline
 
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
@@ -350,6 +355,11 @@ class Counter:
         # slicer is disabled (default), tracking is via model.track(persist=True)
         # with BoT-SORT-ReID inside ultralytics.
         self._slicer_detector: SlicerDetector | None = None
+
+        # tracker_id → person_id (UUID hex). Cached so we don't re-run face
+        # detection every frame for the same person. Cleared on session
+        # boundary (people who disappeared aren't valid anchors any more).
+        self._person_id_for: dict[int, str] = {}
 
         # ----- Crossing-gate state -----
         # Per-tracker recent history: deque of (frame_idx, x_norm, y_norm, conf).
@@ -1034,6 +1044,17 @@ class Counter:
                 # crossing loop reads.
                 self._refresh_global_track_bindings(detections)
 
+                # Persistent identity (face): bind tracker_id → person_id for
+                # unbound trackers. Throttled to every Nth frame to keep CPU
+                # under control — once bound, the binding sticks.
+                if (
+                    self.settings.face_identity_enabled
+                    and self._identity_pipeline is not None
+                    and self.state.venue_id
+                    and self._frame_idx % max(1, self.settings.face_identity_every_n_frames) == 0
+                ):
+                    self._refresh_person_bindings(frame, detections)
+
                 annotated = frame.copy()
                 if len(detections) > 0:
                     annotated = trace_annotator.annotate(annotated, detections)
@@ -1048,9 +1069,19 @@ class Counter:
                 # Back-and-forth movement legitimately produces multiple events
                 # (in → out → in), which is correct for occupancy tracking;
                 # the cooldown gate only filters same-direction re-crossings.
-                # Each entry is (kind, tracker_id, line_name, world_x|None, world_y|None, global_id|None).
+                # Each entry: (kind, tracker_id, line_name, world_x, world_y,
+                #              global_id, person_id) — last two None when not
+                # available.
                 events_buffer: list[
-                    tuple[str, int, str, float | None, float | None, int | None]
+                    tuple[
+                        str,
+                        int,
+                        str,
+                        float | None,
+                        float | None,
+                        int | None,
+                        str | None,
+                    ]
                 ] = []
                 counting_active = self._counting_event.is_set() and self.state.session_id
 
@@ -1067,7 +1098,8 @@ class Counter:
                             continue
                         wx, wy = self._world_pos(detections, det_idx)
                         gid = self._global_id_for.get(tid)
-                        events_buffer.append(("in", tid, line_name, wx, wy, gid))
+                        pid = self._person_id_for.get(tid)
+                        events_buffer.append(("in", tid, line_name, wx, wy, gid, pid))
                         self._last_cross_ts[(tid, line_name, "in")] = now_ts
                     for tid, det_idx in self._collect_crossed_pairs(detections, crossed_out):
                         if not self._passes_crossing_gates(
@@ -1076,7 +1108,8 @@ class Counter:
                             continue
                         wx, wy = self._world_pos(detections, det_idx)
                         gid = self._global_id_for.get(tid)
-                        events_buffer.append(("out", tid, line_name, wx, wy, gid))
+                        pid = self._person_id_for.get(tid)
+                        events_buffer.append(("out", tid, line_name, wx, wy, gid, pid))
                         self._last_cross_ts[(tid, line_name, "out")] = now_ts
 
                 # Polygon zones: occupancy display for all zones, plus a
@@ -1171,6 +1204,51 @@ class Counter:
             if crossed and tracker_id is not None:
                 out.append((int(tracker_id), det_idx))
         return out
+
+    def _refresh_person_bindings(
+        self, frame: np.ndarray, detections: sv.Detections
+    ) -> None:
+        """For each tracked detection without an assigned person_id, crop
+        the bbox and run the face pipeline. Cache the resulting person_id
+        in _person_id_for so subsequent frames skip the work.
+
+        Throttled by face_identity_every_n_frames at the call site, so this
+        runs at most every Nth frame even for unbound trackers.
+        """
+        if detections.tracker_id is None or len(detections) == 0:
+            return
+        venue_id = self.state.venue_id
+        if not venue_id:
+            return
+
+        retention_s: float | None = None
+        if self.settings.face_retention_days > 0:
+            retention_s = self.settings.face_retention_days * 86400.0
+
+        h, w = frame.shape[:2]
+        for det_idx, tid in enumerate(detections.tracker_id):
+            if tid is None:
+                continue
+            tid_i = int(tid)
+            if tid_i in self._person_id_for:
+                continue  # already bound
+            box = detections.xyxy[det_idx]
+            x1 = max(0, int(box[0]))
+            y1 = max(0, int(box[1]))
+            x2 = min(w, int(box[2]))
+            y2 = min(h, int(box[3]))
+            if x2 - x1 < 32 or y2 - y1 < 64:
+                continue  # too small to plausibly contain a usable face
+            crop = frame[y1:y2, x1:x2]
+            try:
+                person_id = self._identity_pipeline.identify(  # type: ignore[union-attr]
+                    crop, venue_id, retention_s=retention_s
+                )
+            except Exception:
+                log.exception("identity pipeline raised")
+                continue
+            if person_id is not None:
+                self._person_id_for[tid_i] = person_id
 
     def _refresh_global_track_bindings(self, detections: sv.Detections) -> None:
         """For each tracked detection with valid world coords, ask the
@@ -1346,7 +1424,15 @@ class Counter:
         mask: np.ndarray | None,
         threshold: int,
         events_buffer: list[
-            tuple[str, int, str, float | None, float | None, int | None]
+            tuple[
+                str,
+                int,
+                str,
+                float | None,
+                float | None,
+                int | None,
+                str | None,
+            ]
         ],
     ) -> None:
         """Track entry/exit transitions for a single interior zone.
@@ -1382,8 +1468,9 @@ class Counter:
                     if persist[tid_i] >= threshold and tid_i not in inside:
                         inside.add(tid_i)
                         gid = self._global_id_for.get(tid_i)
+                        pid = self._person_id_for.get(tid_i)
                         events_buffer.append(
-                            ("in", tid_i, f"zone:{zone_name}", wx, wy, gid)
+                            ("in", tid_i, f"zone:{zone_name}", wx, wy, gid, pid)
                         )
 
         # Trackers that were inside but aren't in this frame: count down.
@@ -1398,8 +1485,9 @@ class Counter:
                 persist[tid_i] = 0
                 wx, wy = last_pos.pop(tid_i, (None, None))
                 gid = self._global_id_for.get(tid_i)
+                pid = self._person_id_for.get(tid_i)
                 events_buffer.append(
-                    ("out", tid_i, f"zone:{zone_name}", wx, wy, gid)
+                    ("out", tid_i, f"zone:{zone_name}", wx, wy, gid, pid)
                 )
 
         # Garbage-collect stale persist entries we know nothing about anymore
@@ -1443,7 +1531,17 @@ class Counter:
 
     def _record_crossings(
         self,
-        events: list[tuple[str, int, str, float | None, float | None, int | None]],
+        events: list[
+            tuple[
+                str,
+                int,
+                str,
+                float | None,
+                float | None,
+                int | None,
+                str | None,
+            ]
+        ],
     ) -> None:
         """Persist a batch of crossing events.
 
@@ -1455,9 +1553,11 @@ class Counter:
             is written with the timestamp captured during phase 1 so the
             persisted ts matches the dedupe window we measured against.
 
-        Each event tuple carries (kind, tracker_id, line_name, world_x, world_y,
-        global_id). global_id is None when the camera isn't in a venue or
-        lacks a homography.
+        Each event tuple carries
+        (kind, tracker_id, line_name, world_x, world_y, global_id, person_id).
+        Both global_id and person_id are None when unbound — global_id is the
+        venue's session-scoped fusion ID; person_id is the persistent
+        face-bound identity from the identity store.
         """
         if not events:
             return
@@ -1474,7 +1574,7 @@ class Counter:
             session_id = self.state.session_id
 
             now = time.time()
-            for kind, tid, line_name, wx, wy, gid in events:
+            for kind, tid, line_name, wx, wy, gid, pid in events:
                 # Cross-camera dedupe: if another camera in the same venue saw
                 # this person crossing the matching line direction within the
                 # dedup window/radius, we still persist the event (with
@@ -1503,6 +1603,7 @@ class Counter:
                         "world_y": wy,
                         "deduped": is_dup,
                         "global_id": gid,
+                        "person_id": pid,
                     }
                 )
 
@@ -1541,6 +1642,7 @@ class Counter:
                     deduped=w["deduped"],
                     ts=w["ts"],
                     global_id=w["global_id"],
+                    person_id=w["person_id"],
                 )
                 persisted.append(event)
             except Exception:

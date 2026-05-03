@@ -11,6 +11,8 @@ DATA_DIR = ROOT_DIR / "data"
 MODELS_DIR = ROOT_DIR / "models"
 VIDEOS_DIR = DATA_DIR / "videos"
 TRACKERS_DIR = ROOT_DIR / "app" / "trackers"
+FACE_KEYS_DIR = DATA_DIR / "face_keys"
+FACE_DB = DATA_DIR / "identity.sqlite3"
 
 
 class Settings(BaseSettings):
@@ -159,8 +161,39 @@ class Settings(BaseSettings):
     # Max video upload size in bytes (default 500 MB).
     max_video_upload_bytes: int = 500 * 1024 * 1024
 
+    # ----- Persistent identity (face) — P9 -----
+    # When enabled, person crops are run through SCRFD + ArcFace to bind a
+    # persistent person_id across visits. Embeddings are AES-256-GCM
+    # encrypted at rest under a per-venue master key (macOS Keychain
+    # preferred, file-fallback otherwise). Auto-purged after retention.
+    face_identity_enabled: bool = True
+    # Process every Nth frame to limit insightface CPU/GPU cost. Higher = cheaper
+    # but slower to bind a tracker_id to a person_id on first appearance.
+    face_identity_every_n_frames: int = 5
+    # Cosine-similarity threshold for "this is the same person." Higher = more
+    # strict (fewer false positives but more first-time-visitor false alarms).
+    face_match_threshold: float = 0.55
+    # How long to retain a person row. 0/None = forever (set explicit policy
+    # before deploying). Default 30 days for sane out-of-the-box behaviour.
+    face_retention_days: int = 30
+    # insightface model pack: 'buffalo_l' (250 MB, accurate) or
+    # 'buffalo_sc' (90 MB, lighter, lower accuracy on small faces).
+    face_model_pack: str = "buffalo_l"
+    # ctx_id: -1 → CPU (uses CoreML EP automatically on Apple Silicon),
+    # 0 → first GPU.
+    face_model_ctx_id: int = -1
+    # Detector input resolution. Larger = better small-face recall, more CPU.
+    face_det_size: int = 640
+    # Required min face height (px) AND min detection confidence apply at
+    # the pipeline level. They're constants in pipeline.py for now; raise an
+    # issue if you need them tunable.
+
+    face_db_path: Path = FACE_DB
+    face_keys_dir: Path = FACE_KEYS_DIR
+
 
 settings = Settings()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
+FACE_KEYS_DIR.mkdir(parents=True, exist_ok=True)
