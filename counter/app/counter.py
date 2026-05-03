@@ -1078,12 +1078,32 @@ class Counter:
         self,
         events: list[tuple[str, int, str, float | None, float | None]],
     ) -> None:
-        if not self.state.session_id or not events:
+        """Persist a batch of crossing events.
+
+        We split the work into two phases so the inference thread isn't blocked
+        on disk fsync:
+          - Phase 1 (under lock): pure in-memory mutations — counter increments,
+            dedupe-buffer maintenance, peak_inside snapshot.
+          - Phase 2 (lock released): SQLite writes + WS broadcast. Each event
+            is written with the timestamp captured during phase 1 so the
+            persisted ts matches the dedupe window we measured against.
+        """
+        if not events:
             return
-        emitted: list[dict[str, Any]] = []
+
+        work: list[dict[str, Any]] = []
+        session_id: str
+        in_count: int
+        out_count: int
+        peak_inside: int
+
         with self._lock:
+            if not self.state.session_id:
+                return
+            session_id = self.state.session_id
+
+            now = time.time()
             for kind, tid, line_name, wx, wy in events:
-                ts = time.time()
                 # Cross-camera dedupe: if another camera in the same venue saw
                 # this person crossing the matching line direction within the
                 # dedup window/radius, we still persist the event (with
@@ -1091,7 +1111,7 @@ class Counter:
                 is_dup = False
                 if self._dedupe_check is not None:
                     try:
-                        is_dup = bool(self._dedupe_check(kind, wx, wy, ts))
+                        is_dup = bool(self._dedupe_check(kind, wx, wy, now))
                     except Exception:
                         log.exception("dedupe check failed; treating as non-duplicate")
                         is_dup = False
@@ -1102,16 +1122,17 @@ class Counter:
                     else:
                         self.state.out_count += 1
 
-                event = self.storage.append_event(
-                    self.state.session_id,
-                    kind,
-                    tid,
-                    line_name=line_name,
-                    world_x=wx,
-                    world_y=wy,
-                    deduped=is_dup,
+                work.append(
+                    {
+                        "ts": now,
+                        "kind": kind,
+                        "tracker_id": tid,
+                        "line_name": line_name,
+                        "world_x": wx,
+                        "world_y": wy,
+                        "deduped": is_dup,
+                    }
                 )
-                emitted.append(event)
 
                 # Record in dedupe buffer regardless — duplicates from a third
                 # camera in the same window should still match.
@@ -1121,7 +1142,7 @@ class Counter:
                     and wy is not None
                 ):
                     try:
-                        self._dedupe_record(kind, wx, wy, ts)
+                        self._dedupe_record(kind, wx, wy, now)
                     except Exception:
                         log.exception("dedupe record failed")
 
@@ -1129,14 +1150,37 @@ class Counter:
             if inside > self.state.peak_inside:
                 self.state.peak_inside = inside
 
-            self.storage.update_session_counts(
-                self.state.session_id,
-                self.state.in_count,
-                self.state.out_count,
-                self.state.peak_inside,
-            )
+            in_count = self.state.in_count
+            out_count = self.state.out_count
+            peak_inside = self.state.peak_inside
 
-        for event in emitted:
+        # Phase 2: lock released. Disk I/O and broadcast happen here so the
+        # inference loop can race ahead while SQLite is fsyncing.
+        persisted: list[dict[str, Any]] = []
+        for w in work:
+            try:
+                event = self.storage.append_event(
+                    session_id,
+                    w["kind"],
+                    w["tracker_id"],
+                    line_name=w["line_name"],
+                    world_x=w["world_x"],
+                    world_y=w["world_y"],
+                    deduped=w["deduped"],
+                    ts=w["ts"],
+                )
+                persisted.append(event)
+            except Exception:
+                log.exception("failed to persist crossing event")
+
+        try:
+            self.storage.update_session_counts(
+                session_id, in_count, out_count, peak_inside
+            )
+        except Exception:
+            log.exception("failed to update session counts")
+
+        for event in persisted:
             self._broadcast_event(event)
         self._broadcast_state()
 

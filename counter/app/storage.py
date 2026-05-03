@@ -275,10 +275,12 @@ class Storage:
         world_x: float | None = None,
         world_y: float | None = None,
         deduped: bool = False,
+        ts: float | None = None,
     ) -> dict[str, Any]:
         if kind not in ("in", "out"):
             raise ValueError(f"Invalid event kind: {kind}")
-        ts = time.time()
+        if ts is None:
+            ts = time.time()
         with self._tx() as conn:
             cur = conn.execute(
                 """
