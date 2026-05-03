@@ -458,6 +458,114 @@ class CameraManager:
             except Exception:
                 log.exception("Error stopping counter on shutdown")
 
+    # ----- metrics ----------------------------------------------------- #
+
+    def metrics(self) -> dict[str, Any]:
+        """Aggregate operational metrics across all cameras + venues.
+
+        Output shape is intentionally flat-ish — easy to pipe into Grafana,
+        a CloudWatch agent, or just render in the dashboard.
+        """
+        with self._lock:
+            cam_rows = self.storage.list_cameras()
+            cameras: list[dict[str, Any]] = []
+            for row in cam_rows:
+                counter = self._counters.get(row["id"])
+                if counter is None:
+                    cameras.append(self._row_state_snapshot(row))
+                    continue
+                snap = counter.get_state_dict()
+                m = counter.get_metrics()
+                # Merge: state (counts, status) on top, metrics (gates,
+                # frame_idx, etc.) underneath. We use distinct keys so they
+                # don't collide.
+                cameras.append(
+                    {
+                        "camera_id": snap["camera_id"],
+                        "name": snap["camera_name"],
+                        "enabled": snap["enabled"],
+                        "running": snap["status"]["running"],
+                        "model_loaded": snap["status"]["model_loaded"],
+                        "camera_open": snap["status"]["camera_open"],
+                        "device": snap["status"]["device"],
+                        "model_name": snap["status"]["model_name"],
+                        "tracker": snap["status"]["tracker"],
+                        "fp16": m["fp16"],
+                        "frame_width": snap["status"]["frame_width"],
+                        "frame_height": snap["status"]["frame_height"],
+                        "fps": snap["status"]["fps"],
+                        "inference_latency_p50_ms": snap["status"][
+                            "inference_latency_p50_ms"
+                        ],
+                        "inference_latency_p95_ms": snap["status"][
+                            "inference_latency_p95_ms"
+                        ],
+                        "last_frame_at": snap["status"]["last_frame_at"],
+                        "last_error": snap["status"]["last_error"],
+                        "last_error_ts": snap["status"]["last_error_ts"],
+                        "frame_idx": m["frame_idx"],
+                        "active_tracks": m["active_tracks"],
+                        "global_id_bound_count": m["global_id_bound_count"],
+                        "gate_rejections": m["gate_rejections"],
+                        "session_id": snap["session_id"],
+                        "in_count": snap["in_count"],
+                        "out_count": snap["out_count"],
+                        "inside": snap["inside"],
+                        "peak_inside": snap["peak_inside"],
+                        "calibrated": snap["calibrated"],
+                        "venue_id": snap["venue_id"],
+                    }
+                )
+
+            return {
+                "cameras": cameras,
+                "global_tracker": self._global_tracker.stats(),
+                "venues": [
+                    {
+                        "venue_id": v["id"],
+                        "name": v["name"],
+                        "dedup_window_s": v["dedup_window_s"],
+                        "dedup_radius_m": v["dedup_radius_m"],
+                    }
+                    for v in self.storage.list_venues()
+                ],
+            }
+
+    def health_ready(self, frame_grace_s: float = 30.0) -> tuple[bool, list[str]]:
+        """Return (is_ready, list_of_issues). Used by /api/health/ready.
+
+        Considers a camera unhealthy if it's enabled but: model isn't
+        loaded, capture isn't open, or no frame has arrived in
+        ``frame_grace_s`` seconds. ``frame_grace_s`` defaults to 30 — long
+        enough to absorb the slowest model warmup but short enough to
+        detect real failures fast.
+        """
+        with self._lock:
+            issues: list[str] = []
+            now = time.time()
+            for row in self.storage.list_cameras():
+                if not row.get("enabled"):
+                    continue
+                counter = self._counters.get(row["id"])
+                if counter is None:
+                    issues.append(f"{row['id']}: no counter")
+                    continue
+                snap = counter.get_state_dict()
+                status = snap["status"]
+                if not status["model_loaded"]:
+                    issues.append(f"{row['id']}: model not loaded")
+                    continue
+                if not status["camera_open"]:
+                    issues.append(f"{row['id']}: camera not open")
+                    continue
+                last_frame = status["last_frame_at"]
+                if last_frame > 0 and (now - last_frame) > frame_grace_s:
+                    issues.append(
+                        f"{row['id']}: no frame in "
+                        f"{int(now - last_frame)}s"
+                    )
+            return (not issues), issues
+
     # ------------------------------------------------------------------ venues
 
     def list_venues(self) -> list[dict[str, Any]]:

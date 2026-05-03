@@ -120,6 +120,43 @@ async def health() -> HealthResponse:
     return HealthResponse(ok=True, version=__version__, cameras=len(cameras))
 
 
+@app.get("/api/health/live")
+async def health_live() -> dict[str, Any]:
+    """Liveness probe. 200 when the API process is responsive. Use this for
+    process-restart decisions; it does NOT check whether cameras are running.
+    """
+    return {"status": "live", "version": __version__}
+
+
+@app.get("/api/health/ready")
+async def health_ready() -> JSONResponse:
+    """Readiness probe. 200 only when every enabled camera has a loaded
+    model, an open capture, and a recent frame. 503 with the failing
+    camera IDs in the body otherwise. Use this for traffic-routing
+    decisions and external monitors.
+    """
+    ok, issues = _manager(app).health_ready()
+    if ok:
+        return JSONResponse({"status": "ready"})
+    return JSONResponse(
+        {"status": "not_ready", "issues": issues},
+        status_code=503,
+    )
+
+
+@app.get("/api/metrics")
+async def metrics() -> dict[str, Any]:
+    """Operational metrics: per-camera FPS / inference latency p50/p95 /
+    gate rejections / track counts; venue-level dedup config; global
+    tracker active-track counts.
+
+    JSON shape is stable across versions; new fields are additive. Suitable
+    for piping into Grafana via the JSON datasource or scraping with
+    a sidecar exporter.
+    """
+    return _manager(app).metrics()
+
+
 # ----------------------------------------------------------------- cameras
 
 

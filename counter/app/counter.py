@@ -132,6 +132,7 @@ class CounterStatus:
     camera_open: bool = False
     fps: float = 0.0
     last_error: str | None = None
+    last_error_ts: float = 0.0
     frame_width: int = 0
     frame_height: int = 0
     device: str = "cpu"
@@ -143,6 +144,11 @@ class CounterStatus:
     video_total_frames: int = 0
     video_position: int = 0
     video_fps: float = 0.0
+    # Latency: per-frame inference time (seconds), p50/p95 over the last N
+    # frames. Updated each iteration of the inference loop. Useful for
+    # detecting model slowdowns or under-resourced devices.
+    inference_latency_p50_ms: float = 0.0
+    inference_latency_p95_ms: float = 0.0
 
 
 @dataclass
@@ -213,6 +219,7 @@ class CounterState:
                 "camera_open": self.status.camera_open,
                 "fps": round(self.status.fps, 2),
                 "last_error": self.status.last_error,
+                "last_error_ts": self.status.last_error_ts,
                 "frame_width": self.status.frame_width,
                 "frame_height": self.status.frame_height,
                 "device": self.status.device,
@@ -223,6 +230,12 @@ class CounterState:
                 "video_total_frames": self.status.video_total_frames,
                 "video_position": self.status.video_position,
                 "video_fps": self.status.video_fps,
+                "inference_latency_p50_ms": round(
+                    self.status.inference_latency_p50_ms, 2
+                ),
+                "inference_latency_p95_ms": round(
+                    self.status.inference_latency_p95_ms, 2
+                ),
             },
         }
 
@@ -620,6 +633,21 @@ class Counter:
         with self._lock:
             return self.state.as_dict()
 
+    def get_metrics(self) -> dict[str, Any]:
+        """Operational counters for the /api/metrics endpoint. Cheap to call —
+        all reads are atomic on existing in-memory dicts."""
+        # Sum per-direction counts for the dashboard. We don't lock — these
+        # ints are atomic in CPython and a slightly-stale read is fine for
+        # metrics.
+        return {
+            "camera_id": self.camera_id,
+            "frame_idx": self._frame_idx,
+            "active_tracks": len(self._track_history),
+            "global_id_bound_count": len(self._global_id_for),
+            "gate_rejections": dict(self._gate_rejections),
+            "fp16": self._fp16,
+        }
+
     def latest_jpeg(self) -> bytes | None:
         return self._latest_jpeg
 
@@ -734,6 +762,7 @@ class Counter:
         except Exception as e:  # noqa: BLE001
             log.exception("[%s] Model load failed", self.camera_id[:8])
             self.state.status.last_error = f"model: {e}"
+            self.state.status.last_error_ts = time.time()
             self.state.status.model_loaded = False
             self._broadcast_state()
             return
@@ -767,6 +796,7 @@ class Counter:
                     wait_s,
                 )
                 self.state.status.last_error = str(e)
+                self.state.status.last_error_ts = now
                 self.state.status.camera_open = False
                 self.state.status.running = False
                 self._broadcast_state()
@@ -815,6 +845,9 @@ class Counter:
             cached_dim = (-1, -1)
             consecutive_fails = 0
             fps_window: list[float] = []
+            # Sliding window of inference durations (seconds, last 60 frames)
+            # used to compute p50/p95 surfaced via /api/metrics.
+            latency_window: deque[float] = deque(maxlen=60)
             last_t = time.time()
             frame_period = 1.0 / video_fps if video_fps > 1.0 else 0.0
             playback_anchor = time.time()
@@ -920,6 +953,7 @@ class Counter:
                 # actual ultralytics device arg must be the bare device name.
                 device_arg = self.state.status.device.split("/")[0]
 
+                inference_t0 = time.time()
                 if self.settings.slicer_enabled:
                     # Tile-based path: split frame, predict per tile, NMS-merge,
                     # then per-camera ByteTrack assigns IDs. We rebuild the
@@ -960,6 +994,8 @@ class Counter:
                         verbose=False,
                     )
                     detections = sv.Detections.from_ultralytics(results[0])
+
+                latency_window.append(time.time() - inference_t0)
 
                 # Drop anything without a tracker_id — line/zone counters need stable
                 # IDs to debounce. Both paths above can produce tracker_id=None
@@ -1087,6 +1123,17 @@ class Counter:
                 avg = sum(fps_window) / len(fps_window) if fps_window else 0
                 self.state.status.fps = (1.0 / avg) if avg > 0 else 0.0
                 self.state.status.last_frame_at = now
+                # Refresh inference latency p50/p95 every frame from the
+                # rolling window. ms units. Cheap (sort 60 floats).
+                if latency_window:
+                    sorted_lat = sorted(latency_window)
+                    n = len(sorted_lat)
+                    self.state.status.inference_latency_p50_ms = (
+                        sorted_lat[n // 2] * 1000.0
+                    )
+                    self.state.status.inference_latency_p95_ms = (
+                        sorted_lat[min(n - 1, int(n * 0.95))] * 1000.0
+                    )
 
                 if is_video:
                     self.state.status.video_position = source.video_position()
