@@ -85,6 +85,26 @@ CREATE TABLE IF NOT EXISTS camera_zones (
     UNIQUE(camera_id, idx),
     FOREIGN KEY(camera_id) REFERENCES cameras(id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS venues (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    floor_plan_w_m REAL NOT NULL DEFAULT 20.0,
+    floor_plan_h_m REAL NOT NULL DEFAULT 20.0,
+    dedup_window_s REAL NOT NULL DEFAULT 3.0,
+    dedup_radius_m REAL NOT NULL DEFAULT 1.0,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS camera_calibrations (
+    camera_id TEXT PRIMARY KEY,
+    points_json TEXT NOT NULL,
+    homography_json TEXT,
+    reprojection_error_m REAL,
+    updated_at REAL NOT NULL,
+    FOREIGN KEY(camera_id) REFERENCES cameras(id) ON DELETE CASCADE
+);
 """
 
 
@@ -104,6 +124,17 @@ def _camera_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "x2": float(d.pop("line_x2")),
         "y2": float(d.pop("line_y2")),
     }
+    if "venue_id" not in d:
+        d["venue_id"] = None
+    return d
+
+
+def _venue_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    d = _row_to_dict(row)
+    d["floor_plan_w_m"] = float(d.get("floor_plan_w_m") or 20.0)
+    d["floor_plan_h_m"] = float(d.get("floor_plan_h_m") or 20.0)
+    d["dedup_window_s"] = float(d.get("dedup_window_s") or 3.0)
+    d["dedup_radius_m"] = float(d.get("dedup_radius_m") or 1.0)
     return d
 
 
@@ -153,6 +184,7 @@ class Storage:
             ("tracker", "TEXT"),
             ("loop_video", "INTEGER NOT NULL DEFAULT 1"),
             ("paused", "INTEGER NOT NULL DEFAULT 0"),
+            ("venue_id", "TEXT"),
         ]:
             if col not in cam_cols:
                 conn.execute(f"ALTER TABLE cameras ADD COLUMN {col} {decl}")
@@ -160,9 +192,18 @@ class Storage:
         ev_cols = {row[1] for row in conn.execute("PRAGMA table_info(events)").fetchall()}
         if "line_name" not in ev_cols:
             conn.execute("ALTER TABLE events ADD COLUMN line_name TEXT")
+        if "world_x" not in ev_cols:
+            conn.execute("ALTER TABLE events ADD COLUMN world_x REAL")
+        if "world_y" not in ev_cols:
+            conn.execute("ALTER TABLE events ADD COLUMN world_y REAL")
+        if "deduped" not in ev_cols:
+            conn.execute("ALTER TABLE events ADD COLUMN deduped INTEGER NOT NULL DEFAULT 0")
 
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_sessions_camera ON sessions(camera_id, started_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cameras_venue ON cameras(venue_id)"
         )
 
     @contextmanager
@@ -231,14 +272,20 @@ class Storage:
         kind: str,
         tracker_id: int | None,
         line_name: str | None = None,
+        world_x: float | None = None,
+        world_y: float | None = None,
+        deduped: bool = False,
     ) -> dict[str, Any]:
         if kind not in ("in", "out"):
             raise ValueError(f"Invalid event kind: {kind}")
         ts = time.time()
         with self._tx() as conn:
             cur = conn.execute(
-                "INSERT INTO events (session_id, ts, kind, tracker_id, line_name) VALUES (?, ?, ?, ?, ?)",
-                (session_id, ts, kind, tracker_id, line_name),
+                """
+                INSERT INTO events (session_id, ts, kind, tracker_id, line_name, world_x, world_y, deduped)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (session_id, ts, kind, tracker_id, line_name, world_x, world_y, int(bool(deduped))),
             )
             event_id = cur.lastrowid
         return {
@@ -248,6 +295,9 @@ class Storage:
             "kind": kind,
             "tracker_id": tracker_id,
             "line_name": line_name,
+            "world_x": world_x,
+            "world_y": world_y,
+            "deduped": bool(deduped),
         }
 
     def get_session(self, session_id: str) -> dict[str, Any] | None:
@@ -296,16 +346,21 @@ class Storage:
         return [_row_to_dict(r) for r in cur.fetchall()]
 
     def export_events_csv(self, session_id: str) -> Iterator[str]:
-        yield "id,session_id,timestamp,kind,tracker_id,line_name\n"
+        yield "id,session_id,timestamp,kind,tracker_id,line_name,world_x,world_y,deduped\n"
         cur = self._conn().execute(
-            "SELECT id, session_id, ts, kind, tracker_id, line_name FROM events WHERE session_id = ? ORDER BY ts ASC",
+            """
+            SELECT id, session_id, ts, kind, tracker_id, line_name, world_x, world_y, deduped
+              FROM events WHERE session_id = ? ORDER BY ts ASC
+            """,
             (session_id,),
         )
         for row in cur:
+            wx = f"{row['world_x']:.3f}" if row['world_x'] is not None else ''
+            wy = f"{row['world_y']:.3f}" if row['world_y'] is not None else ''
             yield (
                 f"{row['id']},{row['session_id']},{row['ts']:.3f},"
                 f"{row['kind']},{row['tracker_id'] if row['tracker_id'] is not None else ''},"
-                f"{(row['line_name'] or '')}\n"
+                f"{(row['line_name'] or '')},{wx},{wy},{int(row['deduped'] or 0)}\n"
             )
 
     def get_setting(self, key: str) -> str | None:
@@ -605,3 +660,159 @@ class Storage:
                     ),
                 )
         return self.list_zones(camera_id)
+
+    # --------------------------------------------------------------- venues
+
+    def list_venues(self) -> list[dict[str, Any]]:
+        cur = self._conn().execute("SELECT * FROM venues ORDER BY created_at ASC")
+        return [_venue_row_to_dict(r) for r in cur.fetchall()]
+
+    def get_venue(self, venue_id: str) -> dict[str, Any] | None:
+        cur = self._conn().execute("SELECT * FROM venues WHERE id = ?", (venue_id,))
+        row = cur.fetchone()
+        return _venue_row_to_dict(row) if row else None
+
+    def create_venue(
+        self,
+        name: str,
+        floor_plan_w_m: float = 20.0,
+        floor_plan_h_m: float = 20.0,
+        dedup_window_s: float = 3.0,
+        dedup_radius_m: float = 1.0,
+    ) -> dict[str, Any]:
+        venue_id = uuid.uuid4().hex
+        now = time.time()
+        with self._tx() as conn:
+            conn.execute(
+                """
+                INSERT INTO venues
+                    (id, name, floor_plan_w_m, floor_plan_h_m,
+                     dedup_window_s, dedup_radius_m, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    venue_id, name, float(floor_plan_w_m), float(floor_plan_h_m),
+                    float(dedup_window_s), float(dedup_radius_m), now, now,
+                ),
+            )
+        return self.get_venue(venue_id)  # type: ignore[return-value]
+
+    def update_venue(
+        self,
+        venue_id: str,
+        *,
+        name: str | None = None,
+        floor_plan_w_m: float | None = None,
+        floor_plan_h_m: float | None = None,
+        dedup_window_s: float | None = None,
+        dedup_radius_m: float | None = None,
+    ) -> dict[str, Any] | None:
+        fields: list[str] = []
+        values: list[Any] = []
+        for col, val in [
+            ("name", name),
+            ("floor_plan_w_m", floor_plan_w_m),
+            ("floor_plan_h_m", floor_plan_h_m),
+            ("dedup_window_s", dedup_window_s),
+            ("dedup_radius_m", dedup_radius_m),
+        ]:
+            if val is not None:
+                fields.append(f"{col} = ?")
+                values.append(val)
+        if not fields:
+            return self.get_venue(venue_id)
+        fields.append("updated_at = ?")
+        values.append(time.time())
+        values.append(venue_id)
+        with self._tx() as conn:
+            conn.execute(
+                f"UPDATE venues SET {', '.join(fields)} WHERE id = ?",
+                values,
+            )
+        return self.get_venue(venue_id)
+
+    def delete_venue(self, venue_id: str) -> bool:
+        with self._tx() as conn:
+            # Detach cameras from this venue rather than delete them.
+            conn.execute(
+                "UPDATE cameras SET venue_id = NULL WHERE venue_id = ?",
+                (venue_id,),
+            )
+            cur = conn.execute("DELETE FROM venues WHERE id = ?", (venue_id,))
+            return cur.rowcount > 0
+
+    def list_cameras_in_venue(self, venue_id: str) -> list[dict[str, Any]]:
+        cur = self._conn().execute(
+            "SELECT * FROM cameras WHERE venue_id = ? ORDER BY created_at ASC",
+            (venue_id,),
+        )
+        return [_camera_row_to_dict(r) for r in cur.fetchall()]
+
+    def assign_camera_to_venue(
+        self, camera_id: str, venue_id: str | None
+    ) -> dict[str, Any] | None:
+        with self._tx() as conn:
+            conn.execute(
+                "UPDATE cameras SET venue_id = ?, updated_at = ? WHERE id = ?",
+                (venue_id, time.time(), camera_id),
+            )
+        return self.get_camera(camera_id)
+
+    # --------------------------------------------------------------- calibrations
+
+    def get_calibration(self, camera_id: str) -> dict[str, Any] | None:
+        cur = self._conn().execute(
+            "SELECT * FROM camera_calibrations WHERE camera_id = ?",
+            (camera_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        d = _row_to_dict(row)
+        try:
+            d["points"] = json.loads(d.pop("points_json"))
+        except Exception:
+            d["points"] = []
+        try:
+            raw = d.pop("homography_json")
+            d["homography"] = json.loads(raw) if raw else None
+        except Exception:
+            d["homography"] = None
+        return d
+
+    def save_calibration(
+        self,
+        camera_id: str,
+        points: list[dict[str, Any]],
+        homography: list[float] | None,
+        reprojection_error_m: float | None,
+    ) -> dict[str, Any]:
+        with self._tx() as conn:
+            conn.execute(
+                """
+                INSERT INTO camera_calibrations
+                    (camera_id, points_json, homography_json, reprojection_error_m, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(camera_id) DO UPDATE SET
+                    points_json = excluded.points_json,
+                    homography_json = excluded.homography_json,
+                    reprojection_error_m = excluded.reprojection_error_m,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    camera_id,
+                    json.dumps(points),
+                    json.dumps(homography) if homography is not None else None,
+                    reprojection_error_m,
+                    time.time(),
+                ),
+            )
+        return self.get_calibration(camera_id)  # type: ignore[return-value]
+
+    def delete_calibration(self, camera_id: str) -> bool:
+        with self._tx() as conn:
+            cur = conn.execute(
+                "DELETE FROM camera_calibrations WHERE camera_id = ?",
+                (camera_id,),
+            )
+            return cur.rowcount > 0

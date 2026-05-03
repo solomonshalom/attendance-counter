@@ -116,3 +116,46 @@ class UpdateCameraRequest(BaseModel):
 
 class PlaybackRequest(BaseModel):
     action: Literal["play", "pause", "restart"]
+
+
+class CreateVenueRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    floor_plan_w_m: float = Field(default=20.0, gt=0.5, le=500.0)
+    floor_plan_h_m: float = Field(default=20.0, gt=0.5, le=500.0)
+    dedup_window_s: float = Field(default=3.0, ge=0.1, le=30.0)
+    dedup_radius_m: float = Field(default=1.0, ge=0.1, le=10.0)
+
+
+class UpdateVenueRequest(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=80)
+    floor_plan_w_m: Optional[float] = Field(default=None, gt=0.5, le=500.0)
+    floor_plan_h_m: Optional[float] = Field(default=None, gt=0.5, le=500.0)
+    dedup_window_s: Optional[float] = Field(default=None, ge=0.1, le=30.0)
+    dedup_radius_m: Optional[float] = Field(default=None, ge=0.1, le=10.0)
+
+
+class AssignVenueRequest(BaseModel):
+    venue_id: Optional[str] = None
+
+
+class WorldPoint(BaseModel):
+    x: float = Field(ge=-500.0, le=500.0)
+    y: float = Field(ge=-500.0, le=500.0)
+
+
+class CalibrationPair(BaseModel):
+    img: Point          # normalized [0,1] image coordinates
+    world: WorldPoint   # meters in the floor plan (y goes top-down to match image)
+
+
+class CalibrationRequest(BaseModel):
+    points: list[CalibrationPair]
+
+    @field_validator("points")
+    @classmethod
+    def _enough_points(cls, v: list[CalibrationPair]) -> list[CalibrationPair]:
+        if len(v) < 4:
+            raise ValueError("at least 4 calibration point pairs required")
+        if len(v) > 32:
+            raise ValueError("at most 32 calibration point pairs")
+        return v

@@ -14,6 +14,7 @@ import CamerasSection from '$lib/components/CamerasSection.svelte';
 import CameraCard from '$lib/components/CameraCard.svelte';
 import CombinedTotals from '$lib/components/CombinedTotals.svelte';
 import ThemeToggle from '$lib/components/ThemeToggle.svelte';
+import VenuesSection from '$lib/components/VenuesSection.svelte';
 
 let sessions = $state([]);
 let sessionsLoading = $state(false);
@@ -102,6 +103,9 @@ const badge = $derived(statusBadge());
 				Real-time counting of people entering and exiting your venue, powered by
 				YOLO and on-device computer vision. No images leave this Mac.
 			</p>
+
+			<!-- Venues (multi-camera dedupe via spatial calibration) -->
+			<VenuesSection cameras={cams} />
 
 			<!-- Cameras management section -->
 			<CamerasSection cameras={cams} />

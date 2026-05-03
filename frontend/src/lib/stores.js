@@ -146,6 +146,20 @@ function persistedStore(key, initial) {
 /** Whether the dashboard combines counts across all cameras with active sessions. */
 export const showCombined = persistedStore('counter.showCombined', false);
 
+/** @typedef {{
+ *   id: string,
+ *   name: string,
+ *   floor_plan_w_m: number,
+ *   floor_plan_h_m: number,
+ *   dedup_window_s: number,
+ *   dedup_radius_m: number,
+ *   created_at: number,
+ *   updated_at: number
+ * }} Venue */
+
+/** @type {import('svelte/store').Writable<Venue[]>} */
+export const venues = writable([]);
+
 /** Color theme: 'light' or 'dark'. Stored as plain string (not JSON) so the
  *  inline script in app.html can read it without parsing. Defaults to system
  *  preference on first load.

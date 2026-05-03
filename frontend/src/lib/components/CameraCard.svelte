@@ -1,21 +1,46 @@
 <script>
 // @ts-nocheck
 import { api } from '../api.js';
-import { eventsByCamera, clearEventsForCamera } from '../stores.js';
+import { eventsByCamera, clearEventsForCamera, venues } from '../stores.js';
 import { formatTime, formatDuration } from '../format.js';
 import LinePreview from './LinePreview.svelte';
 import PlaybackControls from './PlaybackControls.svelte';
 import SettingsPanel from './SettingsPanel.svelte';
+import CalibrationDialog from './CalibrationDialog.svelte';
 
 let { camera } = $props();
 
 let sessionLabel = $state('');
 let actionError = $state(null);
 let actionLoading = $state(false);
+let calibOpen = $state(false);
+let venueBusy = $state(false);
 
 const cameraId = $derived(camera?.camera_id);
 const status = $derived(camera?.status ?? null);
 const events = $derived($eventsByCamera[cameraId] ?? []);
+const venue = $derived(($venues ?? []).find((v) => v.id === camera?.venue_id) ?? null);
+
+async function changeVenue(e) {
+	const value = e.currentTarget.value || null;
+	venueBusy = true;
+	actionError = null;
+	try {
+		await api.assignCameraToVenue(cameraId, value);
+	} catch (err) {
+		actionError = err?.message ?? String(err);
+	} finally {
+		venueBusy = false;
+	}
+}
+
+function openCalibration() {
+	if (!venue) {
+		actionError = 'Add this camera to a venue first.';
+		return;
+	}
+	calibOpen = true;
+}
 
 async function withAction(fn) {
 	actionError = null;
@@ -134,6 +159,33 @@ function startSessionDisabledReason() {
 
 		<div class="cam-tools">
 			<SettingsPanel {camera} />
+
+			{#if $venues.length > 0}
+				<label class="venue-picker">
+					<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none">
+						<path d="M3 12l9-9 9 9M5 10v10h14V10" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+					</svg>
+					<select value={camera?.venue_id ?? ''} onchange={changeVenue} disabled={venueBusy}>
+						<option value="">No venue</option>
+						{#each $venues as v (v.id)}
+							<option value={v.id}>{v.name}</option>
+						{/each}
+					</select>
+				</label>
+
+				{#if camera?.venue_id}
+					<button class="calibrate-btn" class:calibrated={camera?.calibrated} onclick={openCalibration} disabled={venueBusy}>
+						<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none">
+							{#if camera?.calibrated}
+								<path d="M5 13l4 4L19 7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+							{:else}
+								<path d="M3 3l3 9-3 9 18-9z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+							{/if}
+						</svg>
+						{camera?.calibrated ? 'Calibrated' : 'Calibrate'}
+					</button>
+				{/if}
+			{/if}
 		</div>
 	</header>
 
@@ -225,6 +277,13 @@ function startSessionDisabledReason() {
 		</div>
 	</div>
 </section>
+
+<CalibrationDialog
+	open={calibOpen}
+	camera={camera}
+	venue={venue}
+	onclose={() => (calibOpen = false)}
+/>
 
 <style>
 .camera-card {
@@ -351,7 +410,61 @@ function startSessionDisabledReason() {
 	display: flex;
 	flex-wrap: wrap;
 	gap: 8px;
-	align-items: flex-start;
+	align-items: center;
+}
+
+.venue-picker {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	border: 1px solid #e9ecef;
+	background: #fff;
+	color: #495057;
+	border-radius: 12px;
+	padding: 4px 10px;
+	font-size: 13px;
+	font-weight: 500;
+}
+
+.venue-picker select {
+	border: none;
+	background: transparent;
+	font-family: inherit;
+	font-size: 13px;
+	color: rgb(33, 37, 41);
+	padding: 2px 0;
+	cursor: pointer;
+	outline: none;
+}
+
+.calibrate-btn {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	border: 1px solid #e9ecef;
+	background: #fff;
+	color: #495057;
+	border-radius: 12px;
+	padding: 6px 12px;
+	font-size: 13px;
+	font-weight: 500;
+	font-family: inherit;
+	cursor: pointer;
+}
+
+.calibrate-btn:hover:not(:disabled) {
+	background: #f8f9fa;
+}
+
+.calibrate-btn.calibrated {
+	background: #d1f4e0;
+	color: #146c43;
+	border-color: #b5e8c8;
+}
+
+.calibrate-btn:disabled {
+	opacity: 0.5;
+	cursor: not-allowed;
 }
 
 .btn-primary-pill,

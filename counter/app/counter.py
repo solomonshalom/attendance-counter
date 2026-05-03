@@ -224,6 +224,8 @@ class CounterState:
     tracker: str | None = None
     loop_video: bool = True
     paused: bool = False
+    venue_id: str | None = None
+    calibrated: bool = False
     status: CounterStatus = field(default_factory=CounterStatus)
 
     @property
@@ -255,6 +257,8 @@ class CounterState:
             "tracker": self.tracker,
             "loop_video": self.loop_video,
             "paused": self.paused,
+            "venue_id": self.venue_id,
+            "calibrated": self.calibrated,
             "status": {
                 "running": self.status.running,
                 "paused": self.status.paused,
@@ -299,6 +303,8 @@ class Counter:
         loop_video: bool = True,
         lines: list[LineConfig] | None = None,
         zones: list[ZoneConfig] | None = None,
+        venue_id: str | None = None,
+        homography: np.ndarray | None = None,
     ) -> None:
         self.camera_id = camera_id
         self.settings = settings
@@ -332,7 +338,13 @@ class Counter:
             imgsz=imgsz,
             tracker=tracker,
             loop_video=loop_video,
+            venue_id=venue_id,
+            calibrated=homography is not None,
         )
+
+        self._homography: np.ndarray | None = homography
+        self._dedupe_check: Callable[[str, float | None, float | None, float], bool] | None = None
+        self._dedupe_record: Callable[[str, float, float, float], None] | None = None
 
         # Per-line dedup (set of tracker_ids that have already been counted in/out
         # on a specific named line during the current session).
@@ -346,6 +358,15 @@ class Counter:
 
         # Smoother for stable bboxes/anchor positions across frames.
         self._smoother: sv.DetectionsSmoother | None = None
+
+    def set_dedupe_hooks(
+        self,
+        is_duplicate: Callable[[str, float | None, float | None, float], bool] | None,
+        record: Callable[[str, float, float, float], None] | None,
+    ) -> None:
+        with self._lock:
+            self._dedupe_check = is_duplicate
+            self._dedupe_record = record
 
     # ------------------------------------------------------------------ public
 
@@ -830,7 +851,8 @@ class Counter:
                     annotated = label_annotator.annotate(annotated, detections, labels=labels)
 
                 # Counting per line (each line maintains its own dedup set).
-                events_buffer: list[tuple[str, int, str]] = []
+                # Each entry is (kind, tracker_id, line_name, world_x|None, world_y|None).
+                events_buffer: list[tuple[str, int, str, float | None, float | None]] = []
                 for line_name, line_zone in self._line_zones.items():
                     crossed_in, crossed_out = line_zone.trigger(detections)
                     annotated = line_annotator.annotate(annotated, line_zone)
@@ -838,12 +860,18 @@ class Counter:
                         continue
                     in_seen = self._tracked_in_per_line.setdefault(line_name, set())
                     out_seen = self._tracked_out_per_line.setdefault(line_name, set())
-                    new_in = self._collect_crossed_ids(detections, crossed_in, in_seen)
-                    new_out = self._collect_crossed_ids(detections, crossed_out, out_seen)
-                    for tid in new_in:
-                        events_buffer.append(("in", tid, line_name))
-                    for tid in new_out:
-                        events_buffer.append(("out", tid, line_name))
+                    new_in_pairs = self._collect_crossed_pairs(
+                        detections, crossed_in, in_seen
+                    )
+                    new_out_pairs = self._collect_crossed_pairs(
+                        detections, crossed_out, out_seen
+                    )
+                    for tid, det_idx in new_in_pairs:
+                        wx, wy = self._world_pos(detections, det_idx)
+                        events_buffer.append(("in", tid, line_name, wx, wy))
+                    for tid, det_idx in new_out_pairs:
+                        wx, wy = self._world_pos(detections, det_idx)
+                        events_buffer.append(("out", tid, line_name, wx, wy))
 
                 # Polygon zones — visualize and update occupancy. Zones don't
                 # generate count events directly; they're observability surface
@@ -897,36 +925,91 @@ class Counter:
             self._broadcast_state()
 
     @staticmethod
-    def _collect_crossed_ids(
+    def _collect_crossed_pairs(
         detections: sv.Detections,
         crossed_mask: Iterable[bool],
         seen: set[int],
-    ) -> list[int]:
+    ) -> list[tuple[int, int]]:
+        """Return list of (tracker_id, detection_index) for crossings not yet seen."""
         if detections.tracker_id is None:
             return []
-        new_ids: list[int] = []
-        for tracker_id, crossed in zip(detections.tracker_id, crossed_mask):
+        out: list[tuple[int, int]] = []
+        for det_idx, (tracker_id, crossed) in enumerate(zip(detections.tracker_id, crossed_mask)):
             if crossed and tracker_id is not None:
                 tid = int(tracker_id)
                 if tid not in seen:
                     seen.add(tid)
-                    new_ids.append(tid)
-        return new_ids
+                    out.append((tid, det_idx))
+        return out
 
-    def _record_crossings(self, events: list[tuple[str, int, str]]) -> None:
+    def _world_pos(
+        self, detections: sv.Detections, det_idx: int
+    ) -> tuple[float | None, float | None]:
+        """Project a detection's BOTTOM_CENTER anchor through the camera's
+        homography matrix, returning meters in the venue's floor plane."""
+        if self._homography is None:
+            return (None, None)
+        try:
+            box = detections.xyxy[det_idx]
+            bx = float((box[0] + box[2]) / 2.0)
+            by = float(box[3])
+            pt = np.array([[[bx, by]]], dtype=np.float64)
+            world = cv2.perspectiveTransform(pt, self._homography)
+            return float(world[0][0][0]), float(world[0][0][1])
+        except Exception:
+            log.exception("world projection failed")
+            return (None, None)
+
+    def _record_crossings(
+        self,
+        events: list[tuple[str, int, str, float | None, float | None]],
+    ) -> None:
         if not self.state.session_id or not events:
             return
         emitted: list[dict[str, Any]] = []
         with self._lock:
-            for kind, tid, line_name in events:
-                if kind == "in":
-                    self.state.in_count += 1
-                else:
-                    self.state.out_count += 1
+            for kind, tid, line_name, wx, wy in events:
+                ts = time.time()
+                # Cross-camera dedupe: if another camera in the same venue saw
+                # this person crossing the matching line direction within the
+                # dedup window/radius, we still persist the event (with
+                # deduped=1 for analytics) but don't bump the live counter.
+                is_dup = False
+                if self._dedupe_check is not None:
+                    try:
+                        is_dup = bool(self._dedupe_check(kind, wx, wy, ts))
+                    except Exception:
+                        log.exception("dedupe check failed; treating as non-duplicate")
+                        is_dup = False
+
+                if not is_dup:
+                    if kind == "in":
+                        self.state.in_count += 1
+                    else:
+                        self.state.out_count += 1
+
                 event = self.storage.append_event(
-                    self.state.session_id, kind, tid, line_name=line_name
+                    self.state.session_id,
+                    kind,
+                    tid,
+                    line_name=line_name,
+                    world_x=wx,
+                    world_y=wy,
+                    deduped=is_dup,
                 )
                 emitted.append(event)
+
+                # Record in dedupe buffer regardless — duplicates from a third
+                # camera in the same window should still match.
+                if (
+                    self._dedupe_record is not None
+                    and wx is not None
+                    and wy is not None
+                ):
+                    try:
+                        self._dedupe_record(kind, wx, wy, ts)
+                    except Exception:
+                        log.exception("dedupe record failed")
 
             inside = self.state.inside
             if inside > self.state.peak_inside:

@@ -106,6 +106,35 @@ export const api = {
 	exportSessionUrl: (/** @type {string} */ id) =>
 		`${BASE}/api/sessions/${id}/export.csv`,
 
+	// ---- venues ----
+	listVenues: () => request('/api/venues'),
+	getVenue: (/** @type {string} */ id) => request(`/api/venues/${id}`),
+	createVenue: (/** @type {{name:string,floor_plan_w_m?:number,floor_plan_h_m?:number,dedup_window_s?:number,dedup_radius_m?:number}} */ payload) =>
+		request('/api/venues', { method: 'POST', body: JSON.stringify(payload) }),
+	updateVenue: (/** @type {string} */ id, /** @type {object} */ payload) =>
+		request(`/api/venues/${id}`, { method: 'PATCH', body: JSON.stringify(payload) }),
+	deleteVenue: (/** @type {string} */ id) =>
+		request(`/api/venues/${id}`, { method: 'DELETE' }),
+	assignCameraToVenue: (/** @type {string} */ cameraId, /** @type {string|null} */ venueId) =>
+		request(`/api/cameras/${cameraId}/venue`, {
+			method: 'POST',
+			body: JSON.stringify({ venue_id: venueId })
+		}),
+
+	// ---- calibration ----
+	getCalibration: (/** @type {string} */ cameraId) =>
+		request(`/api/cameras/${cameraId}/calibration`),
+	saveCalibration: (
+		/** @type {string} */ cameraId,
+		/** @type {{img:{x:number,y:number},world:{x:number,y:number}}[]} */ points
+	) =>
+		request(`/api/cameras/${cameraId}/calibration`, {
+			method: 'POST',
+			body: JSON.stringify({ points })
+		}),
+	clearCalibration: (/** @type {string} */ cameraId) =>
+		request(`/api/cameras/${cameraId}/calibration`, { method: 'DELETE' }),
+
 	// ---- videos ----
 	listVideos: () => request('/api/videos'),
 	uploadVideo: async (/** @type {File} */ file, /** @type {(p:number)=>void} */ onProgress) => {

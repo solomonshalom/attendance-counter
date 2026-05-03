@@ -424,6 +424,212 @@ html[data-theme="dark"] .pb-error {
   border-color: #6b2530;
 }
 
+/* ---------- zones editor (LinePreview) ---------- */
+html[data-theme="dark"] .zones-panel {
+  background: #22262c;
+  border-color: #3a3d42;
+}
+
+html[data-theme="dark"] .zones-list-head {
+  color: #adb5bd;
+}
+
+html[data-theme="dark"] .zones-empty {
+  background: transparent;
+  border-color: #3a3d42;
+  color: #adb5bd;
+}
+
+html[data-theme="dark"] .zone-row {
+  background: #1a1d22;
+  border-color: #3a3d42;
+  color: #e9ecef;
+}
+
+html[data-theme="dark"] .zone-row.selected {
+  background: #2e2615;
+  border-color: #ffd633;
+}
+
+html[data-theme="dark"] .zone-row-meta {
+  color: #6c757d;
+}
+
+html[data-theme="dark"] .zone-color {
+  background: #51cf66;
+}
+
+html[data-theme="dark"] .zone-row.selected .zone-color {
+  background: #ffd633;
+}
+
+html[data-theme="dark"] .zone-field-label {
+  color: #adb5bd;
+}
+
+html[data-theme="dark"] .zone-field input,
+html[data-theme="dark"] .zone-field select {
+  background: #1a1d22;
+  color: #e9ecef;
+  border-color: #3a3d42;
+}
+
+html[data-theme="dark"] .zone-field input:focus,
+html[data-theme="dark"] .zone-field select:focus {
+  border-color: #e9ecef;
+}
+
+html[data-theme="dark"] .zone-help {
+  background: #2e2615;
+  color: #ffe69c;
+}
+
+html[data-theme="dark"] .zone-danger {
+  color: #ff8a95;
+  border-color: #6b2530;
+}
+
+html[data-theme="dark"] .zone-pill {
+  background: #e9ecef;
+  color: rgb(33, 37, 41);
+}
+
+/* ---------- venues + calibration ---------- */
+html[data-theme="dark"] .venues-card {
+  background: #1a1d22;
+  border-color: #2e3137;
+}
+
+html[data-theme="dark"] .venues-sub,
+html[data-theme="dark"] .venue-meta,
+html[data-theme="dark"] .venues-empty {
+  color: #adb5bd;
+}
+
+html[data-theme="dark"] .venues-empty {
+  border-color: #3a3d42;
+}
+
+html[data-theme="dark"] .venues-error {
+  background: #3d1a1f;
+  color: #ff8a95;
+  border-color: #6b2530;
+}
+
+html[data-theme="dark"] .venue-row {
+  border-color: #2e3137;
+}
+
+html[data-theme="dark"] .venue-name,
+html[data-theme="dark"] .venues-title {
+  color: #e9ecef;
+}
+
+html[data-theme="dark"] .venue-pill {
+  background: #2a2d33;
+  color: #adb5bd;
+}
+
+html[data-theme="dark"] .venue-count {
+  background: #e9ecef;
+  color: rgb(33, 37, 41);
+}
+
+html[data-theme="dark"] .venue-picker {
+  background: #1a1d22;
+  border-color: #3a3d42;
+  color: #adb5bd;
+}
+
+html[data-theme="dark"] .venue-picker select {
+  color: #e9ecef;
+}
+
+html[data-theme="dark"] .calibrate-btn {
+  background: #1a1d22;
+  border-color: #3a3d42;
+  color: #adb5bd;
+}
+
+html[data-theme="dark"] .calibrate-btn:hover:not(:disabled) {
+  background: #2a2d33;
+  color: #e9ecef;
+}
+
+html[data-theme="dark"] .calibrate-btn.calibrated {
+  background: #1d3a2a;
+  color: #8ce0a8;
+  border-color: #2d5540;
+}
+
+/* ---------- calibration dialog (shared with VenueDialog .dialog) ---------- */
+html[data-theme="dark"] .cal-instructions {
+  background: #2e2615;
+  color: #ffe69c;
+  border-color: #5e521f;
+}
+
+html[data-theme="dark"] .cal-canvas {
+  border-color: #3a3d42;
+}
+
+html[data-theme="dark"] .cal-canvas.world {
+  background: #22262c;
+}
+
+html[data-theme="dark"] .pairs-bar {
+  background: #22262c;
+  border-color: #3a3d42;
+}
+
+html[data-theme="dark"] .pair-row {
+  background: #1a1d22;
+  border-color: #3a3d42;
+  color: #e9ecef;
+}
+
+html[data-theme="dark"] .pair-row.selected {
+  background: #2e2615;
+  border-color: #ffd633;
+}
+
+html[data-theme="dark"] .pair-meta,
+html[data-theme="dark"] .pairs-count,
+html[data-theme="dark"] .cal-pane-meta,
+html[data-theme="dark"] .dialog-sub {
+  color: #adb5bd;
+}
+
+html[data-theme="dark"] .pair-num {
+  background: #2a2d33;
+  color: #adb5bd;
+}
+
+html[data-theme="dark"] .result-card {
+  background: #1d3a2a;
+  color: #8ce0a8;
+  border-color: #2d5540;
+}
+
+/* ---------- VenueDialog dedup card ---------- */
+html[data-theme="dark"] .dedup-card {
+  background: #22262c;
+  border-color: #3a3d42;
+}
+
+html[data-theme="dark"] .dedup-help {
+  color: #adb5bd;
+}
+
+/* ---------- Floor plan grid in calibration dialog ---------- */
+html[data-theme="dark"] .cal-floor line {
+  stroke: #2a2d33 !important;
+}
+
+html[data-theme="dark"] .cal-floor rect {
+  stroke: #adb5bd !important;
+}
+
 /* ---------- per-camera settings panel ---------- */
 html[data-theme="dark"] .settings-panel {
   background: #22262c;

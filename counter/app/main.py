@@ -21,7 +21,10 @@ from .config import settings
 from .counter import Counter, LineConfig, ZoneConfig, VIDEO_EXTENSIONS
 from .manager import CameraManager
 from .schemas import (
+    AssignVenueRequest,
+    CalibrationRequest,
     CreateCameraRequest,
+    CreateVenueRequest,
     HealthResponse,
     LineRequest,
     LinesRequest,
@@ -30,6 +33,7 @@ from .schemas import (
     StartSessionRequest,
     UpdateCameraRequest,
     UpdateSessionRequest,
+    UpdateVenueRequest,
     ZonesRequest,
 )
 from .storage import Storage
@@ -410,6 +414,86 @@ async def delete_video(filename: str) -> dict[str, str]:
         raise HTTPException(status_code=404, detail="Video not found")
     target.unlink()
     return {"status": "deleted"}
+
+
+# ------------------------------------------------------------------ venues
+
+
+@app.get("/api/venues")
+async def list_venues() -> list[dict[str, Any]]:
+    return _manager(app).list_venues()
+
+
+@app.post("/api/venues", status_code=201)
+async def create_venue(req: CreateVenueRequest) -> dict[str, Any]:
+    return _manager(app).create_venue(
+        name=req.name,
+        floor_plan_w_m=req.floor_plan_w_m,
+        floor_plan_h_m=req.floor_plan_h_m,
+        dedup_window_s=req.dedup_window_s,
+        dedup_radius_m=req.dedup_radius_m,
+    )
+
+
+@app.get("/api/venues/{venue_id}")
+async def get_venue(venue_id: str) -> dict[str, Any]:
+    venue = _manager(app).get_venue(venue_id)
+    if not venue:
+        raise HTTPException(status_code=404, detail="Venue not found")
+    return venue
+
+
+@app.patch("/api/venues/{venue_id}")
+async def update_venue(venue_id: str, req: UpdateVenueRequest) -> dict[str, Any]:
+    payload = {k: v for k, v in req.model_dump().items() if v is not None}
+    try:
+        return _manager(app).update_venue(venue_id, **payload)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Venue not found")
+
+
+@app.delete("/api/venues/{venue_id}")
+async def delete_venue(venue_id: str) -> dict[str, str]:
+    if not _manager(app).delete_venue(venue_id):
+        raise HTTPException(status_code=404, detail="Venue not found")
+    return {"status": "deleted"}
+
+
+@app.post("/api/cameras/{camera_id}/venue")
+async def assign_camera_to_venue(camera_id: str, req: AssignVenueRequest) -> dict[str, Any]:
+    try:
+        return _manager(app).assign_camera_to_venue(camera_id, req.venue_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Camera not found")
+
+
+# ------------------------------------------------------------- calibration
+
+
+@app.get("/api/cameras/{camera_id}/calibration")
+async def get_calibration(camera_id: str) -> dict[str, Any]:
+    calib = _manager(app).get_calibration(camera_id)
+    if not calib:
+        return {"camera_id": camera_id, "points": [], "homography": None, "reprojection_error_m": None}
+    return calib
+
+
+@app.post("/api/cameras/{camera_id}/calibration")
+async def set_calibration(camera_id: str, req: CalibrationRequest) -> dict[str, Any]:
+    points = [
+        {"img": {"x": p.img.x, "y": p.img.y}, "world": {"x": p.world.x, "y": p.world.y}}
+        for p in req.points
+    ]
+    try:
+        return _manager(app).set_calibration(camera_id, points)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/api/cameras/{camera_id}/calibration")
+async def clear_calibration(camera_id: str) -> dict[str, str]:
+    _manager(app).clear_calibration(camera_id)
+    return {"status": "cleared"}
 
 
 # --------------------------------------------------------------- sessions
