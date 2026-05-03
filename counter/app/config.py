@@ -84,6 +84,13 @@ class Settings(BaseSettings):
 
     max_camera_failures: int = 30
 
+    # Exponential backoff parameters for capture read failures and
+    # inference-loop crashes. Backoff doubles per failure, capped at the max.
+    # A small random jitter (≤ 25 %) prevents thundering herds when many
+    # cameras share a flaky upstream (e.g. a NVR that briefly dropped them all).
+    min_capture_retry_s: float = 0.05
+    max_capture_retry_s: float = 30.0
+
     # Max video upload size in bytes (default 500 MB).
     max_video_upload_bytes: int = 500 * 1024 * 1024
 

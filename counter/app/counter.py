@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import random
 import threading
 import time
 from dataclasses import dataclass, field
@@ -706,20 +707,39 @@ class Counter:
 
         self._broadcast_state()
 
+        # Exponential backoff for inference-loop crashes (capture errors, model
+        # surprises, transient OS issues). Doubles per crash, jitter ≤ 25 %,
+        # resets on a successful re-entry to _inference_loop.
+        backoff_s = self.settings.min_capture_retry_s
+        last_crash_at = 0.0
+
         while not self._stop_event.is_set():
             try:
                 self._inference_loop(model)
             except Exception as e:  # noqa: BLE001
+                now = time.time()
+                # If the last crash was long enough ago, treat this as a fresh
+                # incident and reset backoff. Without this, a camera that's
+                # been healthy for hours but glitches once would inherit the
+                # previous incident's max backoff.
+                if now - last_crash_at > 60.0:
+                    backoff_s = self.settings.min_capture_retry_s
+                last_crash_at = now
+
+                wait_s = min(backoff_s, self.settings.max_capture_retry_s)
+                wait_s += random.uniform(0.0, 0.25 * wait_s)
                 log.exception(
-                    "[%s] Inference loop crashed; restarting in 2s",
+                    "[%s] Inference loop crashed; reopening in %.2fs",
                     self.camera_id[:8],
+                    wait_s,
                 )
                 self.state.status.last_error = str(e)
                 self.state.status.camera_open = False
                 self.state.status.running = False
                 self._broadcast_state()
-                if self._stop_event.wait(2.0):
+                if self._stop_event.wait(wait_s):
                     break
+                backoff_s = min(backoff_s * 2.0, self.settings.max_capture_retry_s)
 
         log.info("[%s] Counter thread exiting", self.camera_id[:8])
 
@@ -808,8 +828,24 @@ class Counter:
                         self.camera_id[:8], consecutive_fails,
                     )
                     if consecutive_fails >= self.settings.max_camera_failures:
-                        raise RuntimeError("Too many consecutive camera read failures")
-                    if self._stop_event.wait(0.05):
+                        # Bail to the outer loop so the capture is reopened
+                        # from scratch — staying in the inner loop here would
+                        # spin forever against a broken cv2.VideoCapture handle.
+                        raise RuntimeError(
+                            f"Too many consecutive camera read failures "
+                            f"({consecutive_fails}); reopening capture"
+                        )
+                    # Exponential backoff with ≤ 10 % jitter. The base unit is
+                    # min_capture_retry_s (50 ms); each consecutive fail
+                    # doubles, capped at max_capture_retry_s. So at fail #1 we
+                    # wait 50 ms, #5 wait ~800 ms, #10 wait ~25 s.
+                    backoff = min(
+                        self.settings.min_capture_retry_s
+                        * (2 ** (consecutive_fails - 1)),
+                        self.settings.max_capture_retry_s,
+                    )
+                    backoff += random.uniform(0.0, 0.1 * backoff)
+                    if self._stop_event.wait(backoff):
                         break
                     continue
                 consecutive_fails = 0
