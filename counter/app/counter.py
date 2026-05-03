@@ -848,10 +848,18 @@ class Counter:
                 )
                 detections = sv.Detections.from_ultralytics(results[0])
 
+                # Drop anything without a tracker_id — line/zone counters need stable
+                # IDs to debounce. Ultralytics' from_ultralytics() returns either
+                # tracker_id=None (no tracking yet) or an int ndarray (all valid),
+                # but we stay defensive against other integrations that might
+                # produce object arrays with None entries.
                 if detections.tracker_id is None:
-                    detections = detections[np.array([], dtype=int)]
-                else:
-                    detections = detections[detections.tracker_id != None]  # noqa: E711
+                    detections = sv.Detections.empty()
+                elif detections.tracker_id.dtype == object:
+                    valid = np.array(
+                        [t is not None for t in detections.tracker_id], dtype=bool
+                    )
+                    detections = detections[valid]
 
                 if self._smoother is not None and len(detections) > 0:
                     try:
