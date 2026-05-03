@@ -20,6 +20,7 @@ from .counter import (
     ZoneConfig,
     _looks_like_video_file,
 )
+from .inference import ModelRegistry
 from .storage import Storage
 
 log = logging.getLogger("counter.manager")
@@ -162,6 +163,10 @@ class CameraManager:
         self._lock = threading.RLock()
         self._counters: dict[str, Counter] = {}
         self._deduper = VenueDeduper()
+        # One registry shared across every Counter the manager owns. Today
+        # that just centralizes model loading; later phases can have it hand
+        # out shared YOLO instances + per-camera trackers for true scale-out.
+        self._registry = ModelRegistry(settings)
 
         self._event_listeners: list[EventCallback] = []
         self._state_listeners: list[StateCallback] = []
@@ -701,6 +706,7 @@ class CameraManager:
             loop_video=bool(row.get("loop_video", True)),
             venue_id=venue_id,
             homography=homography,
+            registry=self._registry,
         )
 
         # Wire dedupe callbacks: counter consults the deduper before persisting

@@ -31,6 +31,12 @@ class Settings(BaseSettings):
 
     device: Literal["mps", "cpu", "cuda", "auto"] = "auto"
 
+    # Half-precision (FP16) inference: 'auto' (enables on CUDA/MPS, never on
+    # CPU), True (force on if device supports it), or False (force off).
+    # FP16 typically gives 1.5–2× throughput on NVIDIA GPUs and Apple Silicon
+    # with no measurable accuracy loss for person detection at typical sizes.
+    fp16: Literal["auto", "true", "false"] = "auto"
+
     # Detection / tracking knobs (defaults; cameras can override per-camera).
     confidence: float = 0.35
     iou: float = 0.5

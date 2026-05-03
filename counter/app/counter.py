@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import random
 import threading
 import time
@@ -20,6 +19,8 @@ from ultralytics import YOLO
 
 from .capture import FrameSource, VIDEO_EXTENSIONS, looks_like_video_file
 from .config import Settings
+from .inference import ModelRegistry, resolve_device as _resolve_device_helper
+from .inference.registry import resolve_fp16
 from .storage import Storage
 
 log = logging.getLogger("counter")
@@ -33,13 +34,9 @@ _looks_like_video_file = looks_like_video_file
 
 
 def _resolve_device(requested: str) -> str:
-    if requested == "auto":
-        if torch.backends.mps.is_available():
-            return "mps"
-        if torch.cuda.is_available():
-            return "cuda"
-        return "cpu"
-    return requested
+    """Backwards-compat alias; the canonical implementation now lives in
+    ``inference.registry`` so the registry can use it during warmup."""
+    return _resolve_device_helper(requested)
 
 
 def _resolve_tracker_path(name: str, settings: Settings) -> str:
@@ -254,10 +251,15 @@ class Counter:
         zones: list[ZoneConfig] | None = None,
         venue_id: str | None = None,
         homography: np.ndarray | None = None,
+        registry: "ModelRegistry | None" = None,
     ) -> None:
         self.camera_id = camera_id
         self.settings = settings
         self.storage = storage
+        # Registry handles model load + warmup + download. Constructed lazily
+        # if not injected so single-Counter test paths still work.
+        from .inference import ModelRegistry as _MR
+        self._registry = registry if registry is not None else _MR(settings)
 
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
@@ -318,6 +320,10 @@ class Counter:
 
         # Smoother for stable bboxes/anchor positions across frames.
         self._smoother: sv.DetectionsSmoother | None = None
+
+        # FP16 flag, resolved by the registry at model-load time. Read by the
+        # inference loop's model.track call.
+        self._fp16: bool = False
 
         # ----- Crossing-gate state -----
         # Per-tracker recent history: deque of (frame_idx, x_norm, y_norm, conf).
@@ -665,49 +671,34 @@ class Counter:
         return (self.state.tracker or self.settings.tracker or "botsort_reid")
 
     def _load_model(self) -> YOLO:
+        """Load this camera's YOLO model via the shared registry.
+
+        The registry handles weight provisioning (download to absolute path,
+        no chdir-magic), the primary→fallback chain, and a one-shot warmup
+        predict so the first real frame doesn't pay the JIT cost. We just
+        record the resolved device + fp16 + actual model name into
+        state.status for the dashboard.
+        """
         device = _resolve_device(self.settings.device)
+        fp16 = resolve_fp16(self.settings.fp16, device)
         self.state.status.device = device
+        # Surface the precision in the status string for operators (e.g.
+        # "mps/fp16" vs "cpu"). No new field in CounterStatus needed.
+        if fp16:
+            self.state.status.device = f"{device}/fp16"
 
-        candidates = [self.settings.model_name]
-        if self.settings.fallback_model_name not in candidates:
-            candidates.append(self.settings.fallback_model_name)
-
-        models_dir = self.settings.models_dir
-        last_err: Exception | None = None
-
-        with self._model_load_lock:
-            prev_cwd = os.getcwd()
-            try:
-                os.chdir(models_dir)
-                for name in candidates:
-                    try:
-                        log.info(
-                            "[%s] Loading YOLO model %s on %s",
-                            self.camera_id[:8], name, device,
-                        )
-                        weight_path = models_dir / name
-                        model_arg = str(weight_path) if weight_path.is_file() else name
-                        model = YOLO(model_arg)
-                        _, _, imgsz = self._resolve_settings()
-                        dummy = np.zeros((imgsz, imgsz, 3), dtype=np.uint8)
-                        model.predict(
-                            dummy,
-                            device=device,
-                            imgsz=imgsz,
-                            verbose=False,
-                        )
-                        self.state.status.model_name = name
-                        return model
-                    except Exception as e:  # noqa: BLE001
-                        log.warning("Failed to load model %s: %s", name, e)
-                        last_err = e
-            finally:
-                try:
-                    os.chdir(prev_cwd)
-                except OSError:
-                    pass
-
-        raise RuntimeError(f"Could not load any YOLO model: {last_err}")
+        _, _, imgsz = self._resolve_settings()
+        model, loaded_name = self._registry.load_dedicated(
+            primary_name=self.settings.model_name,
+            fallback_name=self.settings.fallback_model_name,
+            device=device,
+            warmup_imgsz=imgsz,
+            fp16=fp16,
+        )
+        self.state.status.model_name = loaded_name
+        # Cache the resolved fp16 flag for the inference loop's predict call.
+        self._fp16 = fp16
+        return model
 
     def _run(self) -> None:
         log.info("[%s] Counter thread starting", self.camera_id[:8])
@@ -900,6 +891,9 @@ class Counter:
 
                 conf, iou, imgsz = self._resolve_settings()
 
+                # state.status.device may be "<dev>/fp16" cosmetically; the
+                # actual ultralytics device arg must be the bare device name.
+                device_arg = self.state.status.device.split("/")[0]
                 results = model.track(
                     frame,
                     persist=True,
@@ -909,7 +903,8 @@ class Counter:
                     iou=iou,
                     imgsz=imgsz,
                     max_det=self.settings.max_det,
-                    device=self.state.status.device,
+                    device=device_arg,
+                    half=self._fp16,
                     verbose=False,
                 )
                 detections = sv.Detections.from_ultralytics(results[0])
