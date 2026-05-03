@@ -18,6 +18,7 @@ import supervision as sv
 import torch
 from ultralytics import YOLO
 
+from .capture import FrameSource, VIDEO_EXTENSIONS, looks_like_video_file
 from .config import Settings
 from .storage import Storage
 
@@ -26,7 +27,9 @@ log = logging.getLogger("counter")
 EventCallback = Callable[[str, dict[str, Any]], None]
 StateCallback = Callable[[str, dict[str, Any]], None]
 
-VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm", ".mpg", ".mpeg"}
+# Backwards-compat alias for callers that still import _looks_like_video_file
+# from this module (manager.py).
+_looks_like_video_file = looks_like_video_file
 
 
 def _resolve_device(requested: str) -> str:
@@ -37,20 +40,6 @@ def _resolve_device(requested: str) -> str:
             return "cuda"
         return "cpu"
     return requested
-
-
-def _looks_like_video_file(path: str) -> bool:
-    if not path:
-        return False
-    if path.startswith(("rtsp://", "rtmp://", "http://", "https://")):
-        return False
-    try:
-        int(path)
-        return False
-    except ValueError:
-        pass
-    p = Path(path).expanduser()
-    return p.suffix.lower() in VIDEO_EXTENSIONS or p.is_file()
 
 
 def _resolve_tracker_path(name: str, settings: Settings) -> str:
@@ -71,48 +60,6 @@ def _resolve_tracker_path(name: str, settings: Settings) -> str:
         return str(candidate.resolve())
     log.warning("Tracker %r not found; falling back to bytetrack.yaml", name)
     return "bytetrack.yaml"
-
-
-def _open_capture(
-    source: str,
-    width: int,
-    height: int,
-    fps: int,
-    is_video_file: bool,
-) -> cv2.VideoCapture:
-    """Open camera, RTSP/HTTP stream, or local video file."""
-    if is_video_file:
-        path = str(Path(source).expanduser())
-        cap = cv2.VideoCapture(path)
-        if not cap.isOpened():
-            raise RuntimeError(f"Could not open video file: {source}")
-        return cap
-
-    src: int | str
-    try:
-        src = int(source)
-    except ValueError:
-        src = source
-
-    backend = cv2.CAP_AVFOUNDATION if isinstance(src, int) else cv2.CAP_ANY
-    cap = cv2.VideoCapture(src, backend)
-    if not cap.isOpened():
-        cap = cv2.VideoCapture(src)
-    if not cap.isOpened():
-        if isinstance(src, int):
-            raise RuntimeError(
-                f"Could not open camera index {src}. On macOS, ensure your "
-                "terminal has Camera permission (System Settings → Privacy & "
-                "Security → Camera). Also verify no other app is using the "
-                "camera, or try a different source value."
-            )
-        raise RuntimeError(f"Could not open video source: {source}")
-
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-    cap.set(cv2.CAP_PROP_FPS, fps)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    return cap
 
 
 @dataclass
@@ -814,27 +761,28 @@ class Counter:
         log.info("[%s] Counter thread exiting", self.camera_id[:8])
 
     def _inference_loop(self, model: YOLO) -> None:
-        is_video = self.state.kind == "video" or _looks_like_video_file(self.state.source)
-        cap = _open_capture(
+        # FrameSource picks the right backend (AVFoundation / FFmpeg) and runs
+        # a producer thread for network sources so stale frames are dropped
+        # rather than queued.
+        source = FrameSource(
             self.state.source,
-            self.settings.capture_width,
-            self.settings.capture_height,
-            self.settings.target_fps,
-            is_video_file=is_video,
+            self.state.kind,
+            self.settings,
+            stop_event=self._stop_event,
         )
+        source.open()
+        is_video = source.is_video
 
         try:
-            actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or self.settings.capture_width
-            actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or self.settings.capture_height
-            self.state.status.frame_width = actual_w
-            self.state.status.frame_height = actual_h
+            self.state.status.frame_width = source.width
+            self.state.status.frame_height = source.height
             self.state.status.camera_open = True
             self.state.status.running = True
             self.state.status.last_error = None
             self.state.status.is_video_file = is_video
 
-            video_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0) if is_video else 0.0
-            video_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0) if is_video else 0
+            video_fps = source.video_fps if is_video else 0.0
+            video_total = source.video_total_frames if is_video else 0
             self.state.status.video_fps = video_fps
             self.state.status.video_total_frames = video_total
             self.state.status.video_position = 0
@@ -876,12 +824,12 @@ class Counter:
                     playback_anchor = time.time()  # don't accumulate sleep debt
                     continue
 
-                ok, frame = cap.read()
+                ok, frame = source.read()
                 if not ok or frame is None:
                     if is_video:
                         # End of file.
                         if self.state.loop_video:
-                            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                            source.seek_start()
                             playback_anchor = time.time()
                             continue
                         # No loop -> stay idle but keep last frame visible until restart.
@@ -891,6 +839,18 @@ class Counter:
                         if self._stop_event.wait(0.2):
                             break
                         continue
+
+                    # Watchdog: a network stream that silently went dead
+                    # (read returns False but TCP didn't drop) needs a hard
+                    # reopen to recover. Catches the dead-RTSP failure mode
+                    # where cv2 happily returns False forever.
+                    if source.is_network and source.is_stuck(
+                        self.settings.capture_watchdog_s
+                    ):
+                        raise RuntimeError(
+                            f"No frame in {self.settings.capture_watchdog_s}s "
+                            f"on {self.state.source!r}; reopening capture"
+                        )
 
                     consecutive_fails += 1
                     log.warning(
@@ -1071,9 +1031,7 @@ class Counter:
                 self.state.status.last_frame_at = now
 
                 if is_video:
-                    self.state.status.video_position = int(
-                        cap.get(cv2.CAP_PROP_POS_FRAMES) or 0
-                    )
+                    self.state.status.video_position = source.video_position()
                     if frame_period > 0:
                         # Pace playback to the file's native FPS so detection
                         # timing matches what a live camera would look like.
@@ -1087,7 +1045,7 @@ class Counter:
                             playback_anchor = time.time()
 
         finally:
-            cap.release()
+            source.close()
             self.state.status.camera_open = False
             self.state.status.running = False
             self._broadcast_state()

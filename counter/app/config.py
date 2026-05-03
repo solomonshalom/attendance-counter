@@ -122,6 +122,13 @@ class Settings(BaseSettings):
     min_capture_retry_s: float = 0.05
     max_capture_retry_s: float = 30.0
 
+    # Network-source watchdog: if no fresh frame arrives within this many
+    # seconds, force the capture to reopen. Catches the silent-stuck-stream
+    # failure mode where cv2.VideoCapture.read() blocks forever on a dead
+    # RTSP connection. Only applies to URL sources (rtsp/http); USB and
+    # local-file sources read frame-by-frame and don't need a watchdog.
+    capture_watchdog_s: float = 10.0
+
     # Max video upload size in bytes (default 500 MB).
     max_video_upload_bytes: int = 500 * 1024 * 1024
 
