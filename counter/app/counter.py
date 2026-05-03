@@ -7,6 +7,7 @@ import os
 import random
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -347,7 +348,9 @@ class Counter:
         self._dedupe_check: Callable[[str, float | None, float | None, float], bool] | None = None
         self._dedupe_record: Callable[[str, float, float, float], None] | None = None
 
-        self._line_zones: dict[str, sv.LineZone] = {}
+        # name → (LineZone, LineConfig) so the crossing-gate code can read the
+        # original normalized-coord endpoints (LineZone only stores pixels).
+        self._line_zones: dict[str, tuple[sv.LineZone, LineConfig]] = {}
         self._dirty_geometry = True
 
         # Polygon zones for occupancy display (all zones) and counting
@@ -368,6 +371,30 @@ class Counter:
 
         # Smoother for stable bboxes/anchor positions across frames.
         self._smoother: sv.DetectionsSmoother | None = None
+
+        # ----- Crossing-gate state -----
+        # Per-tracker recent history: deque of (frame_idx, x_norm, y_norm, conf).
+        # Used by the velocity gate (positions over time) and the confidence
+        # gate (mean conf over the recent window). Bounded by config.
+        self._track_history: dict[int, deque[tuple[int, float, float, float | None]]] = {}
+        # First frame index a tracker_id was seen on this camera. Used by the
+        # min_track_age gate. Note: BoT-SORT-ReID can re-bind a previously-seen
+        # ID after a brief absence, so this tracks first-ever-seen, not
+        # first-seen-this-burst — which is the conservative interpretation
+        # (older tracks are MORE trustworthy, not less).
+        self._track_first_frame_idx: dict[int, int] = {}
+        # Last successful crossing per (tracker_id, line_name, kind) so we can
+        # debounce same-direction re-crossings within crossing_cooldown_s.
+        self._last_cross_ts: dict[tuple[int, str, str], float] = {}
+        # Monotonic frame counter; bumped once per inference iteration.
+        self._frame_idx: int = 0
+        # Counters for gate-rejected crossings, for the metrics endpoint.
+        self._gate_rejections: dict[str, int] = {
+            "velocity": 0,
+            "confidence": 0,
+            "track_age": 0,
+            "cooldown": 0,
+        }
 
     def set_dedupe_hooks(
         self,
@@ -526,6 +553,12 @@ class Counter:
             self._zone_inside_ids.clear()
             self._zone_persist.clear()
             self._zone_last_pos.clear()
+            # Reset crossing-gate bookkeeping. Cooldowns and gate-rejection
+            # counters are session-scoped diagnostics; track history persists
+            # because it tracks tracker objects, not events.
+            self._last_cross_ts.clear()
+            for k in self._gate_rejections:
+                self._gate_rejections[k] = 0
             self._dirty_geometry = True
             self._counting_event.set()
         self._broadcast_state()
@@ -558,6 +591,9 @@ class Counter:
             self._zone_inside_ids.clear()
             self._zone_persist.clear()
             self._zone_last_pos.clear()
+            self._last_cross_ts.clear()
+            for k in self._gate_rejections:
+                self._gate_rejections[k] = 0
             self._dirty_geometry = True
             if self.state.session_id:
                 self.storage.update_session_counts(
@@ -616,8 +652,10 @@ class Counter:
 
     # ---------------------------------------------------------------- internal
 
-    def _build_line_zones(self, width: int, height: int) -> dict[str, sv.LineZone]:
-        out: dict[str, sv.LineZone] = {}
+    def _build_line_zones(
+        self, width: int, height: int
+    ) -> dict[str, tuple[sv.LineZone, LineConfig]]:
+        out: dict[str, tuple[sv.LineZone, LineConfig]] = {}
         names_seen: set[str] = set()
         min_thresh = max(1, self.settings.min_crossing_threshold)
         for ln in self.state.lines:
@@ -632,12 +670,13 @@ class Counter:
             # BOTTOM_CENTER ≈ feet; the standard single-anchor for people counting.
             # Default 4-corner trigger silently skips while the bbox straddles
             # the line, which dropped real crossings on long-bodied detections.
-            out[name] = sv.LineZone(
+            zone = sv.LineZone(
                 start=start,
                 end=end,
                 triggering_anchors=(sv.Position.BOTTOM_CENTER,),
                 minimum_crossing_threshold=min_thresh,
             )
+            out[name] = (zone, ln)
         return out
 
     def _build_polygon_zones(self, width: int, height: int) -> dict[str, sv.PolygonZone]:
@@ -935,6 +974,16 @@ class Counter:
                         log.exception("smoother failed; disabling for this loop")
                         self._smoother = None
 
+                # Bump the per-camera frame counter (used by track-age gate)
+                # and refresh the per-tracker history windows used by the
+                # velocity / confidence gates. This must run AFTER the
+                # smoother so the gates use the same anchor positions that
+                # LineZone.trigger sees.
+                self._frame_idx += 1
+                self._update_track_history(detections, fw, fh)
+                if self._frame_idx % 1000 == 0:
+                    self._gc_track_state()
+
                 annotated = frame.copy()
                 if len(detections) > 0:
                     annotated = trace_annotator.annotate(annotated, detections)
@@ -944,24 +993,37 @@ class Counter:
 
                 # Counting per line. sv.LineZone's minimum_crossing_threshold
                 # already filters bbox jitter; we simply emit one event per
-                # `crossed` mask entry. Back-and-forth movement legitimately
-                # produces multiple events (in → out → in), which is correct
-                # for occupancy tracking.
+                # `crossed` mask entry — but only if the tracker passes our
+                # crossing gates (velocity / confidence / age / cooldown).
+                # Back-and-forth movement legitimately produces multiple events
+                # (in → out → in), which is correct for occupancy tracking;
+                # the cooldown gate only filters same-direction re-crossings.
                 # Each entry is (kind, tracker_id, line_name, world_x|None, world_y|None).
                 events_buffer: list[tuple[str, int, str, float | None, float | None]] = []
                 counting_active = self._counting_event.is_set() and self.state.session_id
 
-                for line_name, line_zone in self._line_zones.items():
+                for line_name, (line_zone, line_cfg) in self._line_zones.items():
                     crossed_in, crossed_out = line_zone.trigger(detections)
                     annotated = line_annotator.annotate(annotated, line_zone)
                     if not counting_active:
                         continue
+                    now_ts = time.time()
                     for tid, det_idx in self._collect_crossed_pairs(detections, crossed_in):
+                        if not self._passes_crossing_gates(
+                            tid, line_name, line_cfg, "in", now_ts
+                        ):
+                            continue
                         wx, wy = self._world_pos(detections, det_idx)
                         events_buffer.append(("in", tid, line_name, wx, wy))
+                        self._last_cross_ts[(tid, line_name, "in")] = now_ts
                     for tid, det_idx in self._collect_crossed_pairs(detections, crossed_out):
+                        if not self._passes_crossing_gates(
+                            tid, line_name, line_cfg, "out", now_ts
+                        ):
+                            continue
                         wx, wy = self._world_pos(detections, det_idx)
                         events_buffer.append(("out", tid, line_name, wx, wy))
+                        self._last_cross_ts[(tid, line_name, "out")] = now_ts
 
                 # Polygon zones: occupancy display for all zones, plus a
                 # state-machine counter for zones with role='interior'. The
@@ -1046,6 +1108,143 @@ class Counter:
             if crossed and tracker_id is not None:
                 out.append((int(tracker_id), det_idx))
         return out
+
+    def _update_track_history(
+        self, detections: sv.Detections, fw: int, fh: int
+    ) -> None:
+        """Append the current-frame anchor + confidence to each tracker's
+        rolling history window. Anchors are stored in normalized (0..1) coords
+        so the velocity gate has resolution-independent units."""
+        if detections.tracker_id is None or len(detections) == 0:
+            return
+        if fw <= 0 or fh <= 0:
+            return
+
+        history_len = max(2, int(self.settings.track_history_length))
+        confs = (
+            detections.confidence
+            if detections.confidence is not None
+            else [None] * len(detections)
+        )
+
+        for det_idx, tid in enumerate(detections.tracker_id):
+            if tid is None:
+                continue
+            tid_i = int(tid)
+            box = detections.xyxy[det_idx]
+            ax_norm = float((box[0] + box[2]) * 0.5) / fw
+            ay_norm = float(box[3]) / fh
+            conf = float(confs[det_idx]) if confs[det_idx] is not None else None
+
+            hist = self._track_history.get(tid_i)
+            if hist is None or hist.maxlen != history_len:
+                hist = deque(maxlen=history_len)
+                self._track_history[tid_i] = hist
+            hist.append((self._frame_idx, ax_norm, ay_norm, conf))
+
+            if tid_i not in self._track_first_frame_idx:
+                self._track_first_frame_idx[tid_i] = self._frame_idx
+
+    def _gc_track_state(self) -> None:
+        """Drop history for trackers not seen recently and crossings older than
+        the cooldown's relevance window. Bounded growth for long sessions."""
+        # Tracks not updated in 5× the history-length frames are stale.
+        retain_frames = max(self.settings.track_history_length * 5, 200)
+        cutoff_frame = self._frame_idx - retain_frames
+        stale = [
+            tid
+            for tid, h in self._track_history.items()
+            if h and h[-1][0] < cutoff_frame
+        ]
+        for tid in stale:
+            self._track_history.pop(tid, None)
+            self._track_first_frame_idx.pop(tid, None)
+
+        cooldown = self.settings.crossing_cooldown_s
+        if cooldown > 0:
+            ts_cutoff = time.time() - max(cooldown * 5, 30.0)
+            self._last_cross_ts = {
+                k: ts for k, ts in self._last_cross_ts.items() if ts >= ts_cutoff
+            }
+
+    def _passes_crossing_gates(
+        self,
+        tid: int,
+        line_name: str,
+        line: LineConfig,
+        kind: str,
+        ts: float,
+    ) -> bool:
+        """Return True if a tracker's crossing of this line in this direction
+        should be counted, after applying the velocity / confidence / age /
+        cooldown gates. Defaults preserve current behaviour: with all gates at
+        their disable values, this always returns True."""
+        # Track-age gate: tracker must have been observed for at least N frames.
+        min_age = max(0, int(self.settings.min_track_age))
+        if min_age > 0:
+            first = self._track_first_frame_idx.get(tid)
+            if first is None or (self._frame_idx - first) < min_age:
+                self._gate_rejections["track_age"] += 1
+                return False
+
+        # Cooldown gate: same (tid, line, kind) cannot re-fire within window.
+        cooldown = float(self.settings.crossing_cooldown_s)
+        if cooldown > 0.0:
+            last = self._last_cross_ts.get((tid, line_name, kind))
+            if last is not None and (ts - last) < cooldown:
+                self._gate_rejections["cooldown"] += 1
+                return False
+
+        # Confidence gate: mean recent detection confidence ≥ camera_conf + margin.
+        margin = float(self.settings.crossing_confidence_margin)
+        if margin > 0.0:
+            cam_conf = (
+                self.state.confidence
+                if self.state.confidence is not None
+                else self.settings.confidence
+            )
+            confs = [
+                c
+                for (_, _, _, c) in self._track_history.get(tid, ())
+                if c is not None
+            ]
+            if confs and (sum(confs) / len(confs)) < (cam_conf + margin):
+                self._gate_rejections["confidence"] += 1
+                return False
+
+        # Velocity gate: |normal-component velocity| ≥ threshold.
+        v_thresh = float(self.settings.velocity_gate)
+        if v_thresh > 0.0:
+            v_normal = self._normal_velocity(tid, line)
+            if v_normal < v_thresh:
+                self._gate_rejections["velocity"] += 1
+                return False
+
+        return True
+
+    def _normal_velocity(self, tid: int, line: LineConfig) -> float:
+        """Return |projection of tracker's recent velocity onto the line's
+        normal direction|, in normalized units (frame-fraction per frame).
+        Returns 0 when there's not enough history to compute meaningfully."""
+        hist = self._track_history.get(tid)
+        if not hist or len(hist) < 2:
+            return 0.0
+        f0, x0, y0, _ = hist[0]
+        f1, x1, y1, _ = hist[-1]
+        frames = f1 - f0
+        if frames <= 0:
+            return 0.0
+        vx = (x1 - x0) / frames
+        vy = (y1 - y0) / frames
+        # Line direction → its unit normal (rotated 90°).
+        lx = line.x2 - line.x1
+        ly = line.y2 - line.y1
+        L = (lx * lx + ly * ly) ** 0.5
+        if L < 1e-9:
+            return 0.0
+        nx = -ly / L
+        ny = lx / L
+        return abs(vx * nx + vy * ny)
 
     def _update_zone_state_machine(
         self,

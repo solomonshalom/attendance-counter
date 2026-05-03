@@ -55,9 +55,40 @@ class Settings(BaseSettings):
     # Min frames a tracker must persist on the opposite side before counting.
     min_crossing_threshold: int = 3
 
-    # Minimum normal velocity (px/frame) at the moment of crossing. Filters
-    # out loiterers oscillating across the line. 0 disables the gate.
+    # ----- Crossing gates -----
+    # These keep counts honest by rejecting line triggers from
+    #  (a) very-low-velocity tracks (loiterers oscillating across the line),
+    #  (b) low-confidence detections (flickering ghost-detections),
+    #  (c) brand-new tracks that materialised on top of the line, and
+    #  (d) the same tracker re-crossing in the same direction within a window.
+
+    # Minimum normal-component velocity at the moment of crossing, in units of
+    # frame-fraction per frame. 0.005 ≈ walking speed on most cameras (a
+    # person at 1 m/s through a 6 m field of view at 30 fps moves ~0.005
+    # of the frame per frame). 0.0 disables the gate.
     velocity_gate: float = 0.0
+
+    # Track must have been observed for at least this many frames before any
+    # crossing it triggers is counted. Catches the rare "tracker spawned on
+    # top of the line" false positive. min_crossing_threshold mostly covers
+    # this already, so 0 is safe by default.
+    min_track_age: int = 0
+
+    # Reject same-direction re-crossings of the same line by the same tracker
+    # within this many seconds. 1.5 s is conservative — a person walking
+    # through a doorway and immediately turning around takes longer than that
+    # in practice, so this only filters jitter / loitering. 0.0 disables.
+    crossing_cooldown_s: float = 1.5
+
+    # Required margin above the camera's confidence threshold for the mean
+    # detection confidence over the tracker's recent history at crossing
+    # time. 0.05 means "confidence must average ≥ camera_conf + 0.05 over
+    # the last few frames." 0.0 disables.
+    crossing_confidence_margin: float = 0.0
+
+    # How many recent (frame, x_norm, y_norm, conf) samples we keep per
+    # tracker to compute velocity and confidence-mean from.
+    track_history_length: int = 10
 
     default_line_x1: float = 0.5
     default_line_y1: float = 0.0
