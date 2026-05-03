@@ -198,6 +198,15 @@ class Storage:
             conn.execute("ALTER TABLE events ADD COLUMN world_y REAL")
         if "deduped" not in ev_cols:
             conn.execute("ALTER TABLE events ADD COLUMN deduped INTEGER NOT NULL DEFAULT 0")
+        if "global_id" not in ev_cols:
+            # Venue-wide identity (cross-camera). Nullable: events from
+            # uncalibrated cameras or cameras outside any venue have no
+            # global_id and represent a single per-camera tracker_id.
+            conn.execute("ALTER TABLE events ADD COLUMN global_id INTEGER")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_events_global "
+                "ON events(global_id, ts)"
+            )
 
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_sessions_camera ON sessions(camera_id, started_at)"
@@ -276,6 +285,7 @@ class Storage:
         world_y: float | None = None,
         deduped: bool = False,
         ts: float | None = None,
+        global_id: int | None = None,
     ) -> dict[str, Any]:
         if kind not in ("in", "out"):
             raise ValueError(f"Invalid event kind: {kind}")
@@ -284,10 +294,22 @@ class Storage:
         with self._tx() as conn:
             cur = conn.execute(
                 """
-                INSERT INTO events (session_id, ts, kind, tracker_id, line_name, world_x, world_y, deduped)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO events
+                    (session_id, ts, kind, tracker_id, line_name,
+                     world_x, world_y, deduped, global_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (session_id, ts, kind, tracker_id, line_name, world_x, world_y, int(bool(deduped))),
+                (
+                    session_id,
+                    ts,
+                    kind,
+                    tracker_id,
+                    line_name,
+                    world_x,
+                    world_y,
+                    int(bool(deduped)),
+                    global_id,
+                ),
             )
             event_id = cur.lastrowid
         return {
@@ -300,6 +322,7 @@ class Storage:
             "world_x": world_x,
             "world_y": world_y,
             "deduped": bool(deduped),
+            "global_id": global_id,
         }
 
     def get_session(self, session_id: str) -> dict[str, Any] | None:
@@ -348,10 +371,14 @@ class Storage:
         return [_row_to_dict(r) for r in cur.fetchall()]
 
     def export_events_csv(self, session_id: str) -> Iterator[str]:
-        yield "id,session_id,timestamp,kind,tracker_id,line_name,world_x,world_y,deduped\n"
+        yield (
+            "id,session_id,timestamp,kind,tracker_id,line_name,"
+            "world_x,world_y,deduped,global_id\n"
+        )
         cur = self._conn().execute(
             """
-            SELECT id, session_id, ts, kind, tracker_id, line_name, world_x, world_y, deduped
+            SELECT id, session_id, ts, kind, tracker_id, line_name,
+                   world_x, world_y, deduped, global_id
               FROM events WHERE session_id = ? ORDER BY ts ASC
             """,
             (session_id,),
@@ -359,10 +386,12 @@ class Storage:
         for row in cur:
             wx = f"{row['world_x']:.3f}" if row['world_x'] is not None else ''
             wy = f"{row['world_y']:.3f}" if row['world_y'] is not None else ''
+            gid = row['global_id'] if row['global_id'] is not None else ''
             yield (
                 f"{row['id']},{row['session_id']},{row['ts']:.3f},"
                 f"{row['kind']},{row['tracker_id'] if row['tracker_id'] is not None else ''},"
-                f"{(row['line_name'] or '')},{wx},{wy},{int(row['deduped'] or 0)}\n"
+                f"{(row['line_name'] or '')},{wx},{wy},"
+                f"{int(row['deduped'] or 0)},{gid}\n"
             )
 
     def get_setting(self, key: str) -> str | None:

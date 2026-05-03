@@ -22,6 +22,7 @@ from .counter import (
 )
 from .inference import ModelRegistry
 from .storage import Storage
+from .tracking import GlobalTracker
 
 log = logging.getLogger("counter.manager")
 
@@ -167,14 +168,19 @@ class CameraManager:
         # that just centralizes model loading; later phases can have it hand
         # out shared YOLO instances + per-camera trackers for true scale-out.
         self._registry = ModelRegistry(settings)
+        # Venue-level person-identity fusion. Called per-frame by each
+        # Counter that has a homography + venue assignment, returns the
+        # bound global_id so events can be tagged with cross-camera identity.
+        self._global_tracker = GlobalTracker()
 
         self._event_listeners: list[EventCallback] = []
         self._state_listeners: list[StateCallback] = []
         self._camera_list_listeners: list[CameraListCallback] = []
 
-        # Hydrate dedupe service with current venues.
+        # Hydrate dedupe service AND global tracker with current venues.
         for v in self.storage.list_venues():
             self._deduper.upsert_venue(v)
+            self._global_tracker.upsert_venue(v)
 
         self._bootstrap_default_if_empty()
         self._load_existing_cameras()
@@ -385,6 +391,10 @@ class CameraManager:
                 except Exception:
                     log.exception("Error stopping camera %s during delete", camera_id)
             removed = self.storage.delete_camera(camera_id)
+            # Drop any global-tracker bindings this camera contributed so a
+            # future tracker_id with the same int doesn't inherit a stale
+            # global_id from the deleted camera's history.
+            self._global_tracker.clear_camera_bindings(camera_id)
         if removed:
             self._broadcast_camera_list()
         return removed
@@ -474,6 +484,7 @@ class CameraManager:
         with self._lock:
             venue = self.storage.create_venue(**kwargs)
         self._deduper.upsert_venue(venue)
+        self._global_tracker.upsert_venue(venue)
         return venue
 
     def update_venue(self, venue_id: str, **kwargs: Any) -> dict[str, Any]:
@@ -482,6 +493,7 @@ class CameraManager:
         if not venue:
             raise KeyError(venue_id)
         self._deduper.upsert_venue(venue)
+        self._global_tracker.upsert_venue(venue)
         return venue
 
     def delete_venue(self, venue_id: str) -> bool:
@@ -498,6 +510,7 @@ class CameraManager:
                         self._wire_dedupe_hooks(counter, cam_id, venue_id=None)
         if removed:
             self._deduper.remove_venue(venue_id)
+            self._global_tracker.remove_venue(venue_id)
             self._broadcast_camera_list()
         return removed
 
@@ -720,13 +733,13 @@ class CameraManager:
         camera_id: str,
         venue_id: str | None,
     ) -> None:
-        """Attach or detach the venue-level dedupe hooks on a counter.
+        """Attach or detach the venue-level dedupe + global-tracker hooks.
 
-        Hooks are only meaningful when both:
+        Both sets of hooks are only meaningful when:
           - the camera is assigned to a venue, and
           - it has a homography (so world coords are available).
-        Otherwise we clear the hooks; events still flow but never get matched
-        against another camera's events.
+        Otherwise we clear them; per-camera tracking and counting still
+        function, just without cross-camera identity fusion.
         """
         has_h = counter.has_homography()
         if venue_id and has_h:
@@ -738,8 +751,17 @@ class CameraManager:
                     venue_id, camera_id, kind, wx, wy, ts
                 ),
             )
+            counter.set_global_track_hook(
+                lambda tid, wx, wy, ts: self._global_tracker.upsert(
+                    venue_id, camera_id, tid, wx, wy, ts
+                )
+            )
         else:
             counter.set_dedupe_hooks(None, None)
+            counter.set_global_track_hook(None)
+            # Drop any leftover bindings so a re-wire from a different
+            # venue doesn't see this camera's old tracker_ids.
+            self._global_tracker.clear_camera_bindings(camera_id)
 
     def _row_state_snapshot(self, row: dict[str, Any]) -> dict[str, Any]:
         return {

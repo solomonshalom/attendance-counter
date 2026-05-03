@@ -297,6 +297,12 @@ class Counter:
         self._homography: np.ndarray | None = homography
         self._dedupe_check: Callable[[str, float | None, float | None, float], bool] | None = None
         self._dedupe_record: Callable[[str, float, float, float], None] | None = None
+        # Optional venue-level global-tracker hook. Called every frame for
+        # each tracker_id with valid world coords; returns the bound
+        # global_id (or None when there's no venue / homography). Cached
+        # per-frame in self._global_id_for so crossings can include it.
+        self._global_track_hook: Callable[[int, float, float, float], int | None] | None = None
+        self._global_id_for: dict[int, int] = {}
 
         # name → (LineZone, LineConfig) so the crossing-gate code can read the
         # original normalized-coord endpoints (LineZone only stores pixels).
@@ -364,6 +370,18 @@ class Counter:
         with self._lock:
             self._dedupe_check = is_duplicate
             self._dedupe_record = record
+
+    def set_global_track_hook(
+        self,
+        hook: Callable[[int, float, float, float], int | None] | None,
+    ) -> None:
+        """Attach the venue-level GlobalTracker callback. Called per visible
+        tracker_id per frame; returns the bound global_id."""
+        with self._lock:
+            self._global_track_hook = hook
+            # Drop the per-frame cache so a stale global_id from the previous
+            # hook doesn't leak into the next frame's events.
+            self._global_id_for.clear()
 
     def update_homography(self, H: np.ndarray | None) -> None:
         """Replace the homography matrix used for image→world projection.
@@ -973,6 +991,13 @@ class Counter:
                 if self._frame_idx % 1000 == 0:
                     self._gc_track_state()
 
+                # Refresh venue-level identity bindings. We re-key every
+                # visible tracker against the GlobalTracker each frame so
+                # cross-camera matches happen as people move, not only at
+                # crossing time. _global_id_for is the per-frame cache the
+                # crossing loop reads.
+                self._refresh_global_track_bindings(detections)
+
                 annotated = frame.copy()
                 if len(detections) > 0:
                     annotated = trace_annotator.annotate(annotated, detections)
@@ -987,8 +1012,10 @@ class Counter:
                 # Back-and-forth movement legitimately produces multiple events
                 # (in → out → in), which is correct for occupancy tracking;
                 # the cooldown gate only filters same-direction re-crossings.
-                # Each entry is (kind, tracker_id, line_name, world_x|None, world_y|None).
-                events_buffer: list[tuple[str, int, str, float | None, float | None]] = []
+                # Each entry is (kind, tracker_id, line_name, world_x|None, world_y|None, global_id|None).
+                events_buffer: list[
+                    tuple[str, int, str, float | None, float | None, int | None]
+                ] = []
                 counting_active = self._counting_event.is_set() and self.state.session_id
 
                 for line_name, (line_zone, line_cfg) in self._line_zones.items():
@@ -1003,7 +1030,8 @@ class Counter:
                         ):
                             continue
                         wx, wy = self._world_pos(detections, det_idx)
-                        events_buffer.append(("in", tid, line_name, wx, wy))
+                        gid = self._global_id_for.get(tid)
+                        events_buffer.append(("in", tid, line_name, wx, wy, gid))
                         self._last_cross_ts[(tid, line_name, "in")] = now_ts
                     for tid, det_idx in self._collect_crossed_pairs(detections, crossed_out):
                         if not self._passes_crossing_gates(
@@ -1011,7 +1039,8 @@ class Counter:
                         ):
                             continue
                         wx, wy = self._world_pos(detections, det_idx)
-                        events_buffer.append(("out", tid, line_name, wx, wy))
+                        gid = self._global_id_for.get(tid)
+                        events_buffer.append(("out", tid, line_name, wx, wy, gid))
                         self._last_cross_ts[(tid, line_name, "out")] = now_ts
 
                 # Polygon zones: occupancy display for all zones, plus a
@@ -1095,6 +1124,36 @@ class Counter:
             if crossed and tracker_id is not None:
                 out.append((int(tracker_id), det_idx))
         return out
+
+    def _refresh_global_track_bindings(self, detections: sv.Detections) -> None:
+        """For each tracked detection with valid world coords, ask the
+        venue-level GlobalTracker for the bound global_id and cache it for
+        this frame so the crossing loop can attach it to events.
+
+        Without a hook (camera not in a venue, or no homography), this is a
+        no-op and global_id stays absent on emitted events.
+        """
+        # Always reset; stale entries from last frame would leak into events.
+        self._global_id_for.clear()
+        if self._global_track_hook is None or self._homography is None:
+            return
+        if detections.tracker_id is None or len(detections) == 0:
+            return
+
+        ts = time.time()
+        for det_idx, tid in enumerate(detections.tracker_id):
+            if tid is None:
+                continue
+            wx, wy = self._world_pos(detections, det_idx)
+            if wx is None or wy is None:
+                continue
+            try:
+                gid = self._global_track_hook(int(tid), wx, wy, ts)
+            except Exception:
+                log.exception("global track hook raised")
+                continue
+            if gid is not None:
+                self._global_id_for[int(tid)] = int(gid)
 
     def _update_track_history(
         self, detections: sv.Detections, fw: int, fh: int
@@ -1239,7 +1298,9 @@ class Counter:
         detections: sv.Detections,
         mask: np.ndarray | None,
         threshold: int,
-        events_buffer: list[tuple[str, int, str, float | None, float | None]],
+        events_buffer: list[
+            tuple[str, int, str, float | None, float | None, int | None]
+        ],
     ) -> None:
         """Track entry/exit transitions for a single interior zone.
 
@@ -1273,7 +1334,10 @@ class Counter:
                     persist[tid_i] = max(0, persist.get(tid_i, 0)) + 1
                     if persist[tid_i] >= threshold and tid_i not in inside:
                         inside.add(tid_i)
-                        events_buffer.append(("in", tid_i, f"zone:{zone_name}", wx, wy))
+                        gid = self._global_id_for.get(tid_i)
+                        events_buffer.append(
+                            ("in", tid_i, f"zone:{zone_name}", wx, wy, gid)
+                        )
 
         # Trackers that were inside but aren't in this frame: count down.
         for tid_i in list(inside):
@@ -1286,7 +1350,10 @@ class Counter:
                 # quick re-entry doesn't re-trigger from stale positive count.
                 persist[tid_i] = 0
                 wx, wy = last_pos.pop(tid_i, (None, None))
-                events_buffer.append(("out", tid_i, f"zone:{zone_name}", wx, wy))
+                gid = self._global_id_for.get(tid_i)
+                events_buffer.append(
+                    ("out", tid_i, f"zone:{zone_name}", wx, wy, gid)
+                )
 
         # Garbage-collect stale persist entries we know nothing about anymore
         # (not inside, not now-detected, fully decayed). Bound is implicit but
@@ -1329,7 +1396,7 @@ class Counter:
 
     def _record_crossings(
         self,
-        events: list[tuple[str, int, str, float | None, float | None]],
+        events: list[tuple[str, int, str, float | None, float | None, int | None]],
     ) -> None:
         """Persist a batch of crossing events.
 
@@ -1340,6 +1407,10 @@ class Counter:
           - Phase 2 (lock released): SQLite writes + WS broadcast. Each event
             is written with the timestamp captured during phase 1 so the
             persisted ts matches the dedupe window we measured against.
+
+        Each event tuple carries (kind, tracker_id, line_name, world_x, world_y,
+        global_id). global_id is None when the camera isn't in a venue or
+        lacks a homography.
         """
         if not events:
             return
@@ -1356,7 +1427,7 @@ class Counter:
             session_id = self.state.session_id
 
             now = time.time()
-            for kind, tid, line_name, wx, wy in events:
+            for kind, tid, line_name, wx, wy, gid in events:
                 # Cross-camera dedupe: if another camera in the same venue saw
                 # this person crossing the matching line direction within the
                 # dedup window/radius, we still persist the event (with
@@ -1384,6 +1455,7 @@ class Counter:
                         "world_x": wx,
                         "world_y": wy,
                         "deduped": is_dup,
+                        "global_id": gid,
                     }
                 )
 
@@ -1421,6 +1493,7 @@ class Counter:
                     world_y=w["world_y"],
                     deduped=w["deduped"],
                     ts=w["ts"],
+                    global_id=w["global_id"],
                 )
                 persisted.append(event)
             except Exception:
