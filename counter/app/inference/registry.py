@@ -49,13 +49,25 @@ def resolve_device(requested: str) -> str:
 def resolve_fp16(requested: str | bool, device: str) -> bool:
     """Decide whether to run in FP16. ``requested`` can be:
        - 'auto' (default): on CUDA/MPS yes, on CPU no.
-       - True/False: honour explicitly.
+       - True/False / 'true'/'false' (string): honour explicitly.
        FP16 isn't safe on CPU (lots of ops fall back to FP32 with overhead),
        so we never enable it there even if requested.
+
+       NB: ``bool("false")`` is True in Python (non-empty string), so we MUST
+       handle string values explicitly. Without this, COUNTER_FP16=false from
+       the env was silently turning FP16 ON.
     """
     if device == "cpu":
         return False
-    if requested == "auto":
+    if isinstance(requested, str):
+        r = requested.strip().lower()
+        if r == "auto":
+            return device in ("cuda", "mps")
+        if r in ("true", "1", "yes", "on"):
+            return True
+        if r in ("false", "0", "no", "off"):
+            return False
+        # Unknown string → fall back to auto.
         return device in ("cuda", "mps")
     return bool(requested)
 
